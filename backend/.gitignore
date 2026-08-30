@@ -1,0 +1,55 @@
+# ─── Backend .gitignore (Spring Boot / Maven) ─────────────────────────────────
+
+# ── Maven build output ────────────────────────────────────────────────────────
+target/
+build/
+!**/src/main/**/target/
+!**/src/test/**/target/
+!**/src/main/**/build/
+!**/src/test/**/build/
+.env
+
+# Maven wrapper JAR (the .cmd and shell scripts should be committed)
+.mvn/wrapper/maven-wrapper.jar
+
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+# IntelliJ IDEA
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Eclipse / STS
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# VS Code
+.vscode/
+
+# ── Logs & test artifacts ─────────────────────────────────────────────────────
+*.log
+build-test.log
+logs/
+hs_err_pid*.log
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example

@@ -1,0 +1,958 @@
+package com.example.gov_scheme_backend.services.impl;
+
+import com.example.gov_scheme_backend.dto.request.disbursement.StageConfigurationRequest;
+import com.example.gov_scheme_backend.dto.request.disbursement.StageDto;
+import com.example.gov_scheme_backend.dto.response.disbursement.DisbursementMilestoneResponse;
+import com.example.gov_scheme_backend.dto.response.disbursement.DisbursementPlanResponse;
+import com.example.gov_scheme_backend.dto.response.disbursement.OverdueMilestoneResponse;
+import com.example.gov_scheme_backend.entities.*;
+import com.example.gov_scheme_backend.enums.ApplicationStatus;
+import com.example.gov_scheme_backend.enums.AuditAction;
+import com.example.gov_scheme_backend.enums.MilestoneStatus;
+import com.example.gov_scheme_backend.enums.Role;
+import com.example.gov_scheme_backend.exceptions.BadRequestException;
+import com.example.gov_scheme_backend.exceptions.ResourceNotFoundException;
+import com.example.gov_scheme_backend.repositories.*;
+import com.example.gov_scheme_backend.services.DisbursementService;
+import com.example.gov_scheme_backend.services.NotificationService;
+import com.example.gov_scheme_backend.dto.response.disbursement.MilestoneContextResponse;
+import com.example.gov_scheme_backend.dto.response.disbursement.SuggestedStagesResponse;
+import com.example.gov_scheme_backend.enums.NotificationType;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+@Service
+public class DisbursementServiceImpl implements DisbursementService {
+
+    @Autowired
+    private DisbursementPlanRepo planRepo;
+
+    @Autowired
+    private DisbursementMilestoneRepo milestoneRepo;
+
+    @Autowired
+    private ApplicationRepo applicationRepo;
+
+    @Autowired
+    private SchemeRepo schemeRepo;
+
+    @Autowired
+    private UserRepo userRepo;
+
+    @Autowired
+    private AuditLogRepo auditLogRepo;
+
+    @Autowired
+    private SchemeCategoryRepository schemeCategoryRepository;
+
+    @Autowired
+    private NotificationRepo notificationRepo;
+
+    @Autowired
+    private NotificationService notificationService;
+
+    @Autowired(required = false)
+    private VerificationWorkflowRepository workflowRepository;
+
+    @Override
+    @Transactional
+    public DisbursementPlanResponse configurePlan(Long planId, StageConfigurationRequest request) {
+        DisbursementPlan plan = planRepo.findById(planId)
+                .orElseThrow(() -> new ResourceNotFoundException("Disbursement plan not found with ID: " + planId));
+
+        if (request.getStages() == null || request.getStages().isEmpty()) {
+            throw new BadRequestException("At least one stage configuration is required");
+        }
+
+        // Validate number of stages
+        if (request.getStages().size() != plan.getTotalStages()) {
+            throw new BadRequestException("Stage configuration count (" + request.getStages().size()
+                    + ") must match the plan's total stages (" + plan.getTotalStages() + ")");
+        }
+
+        // Guard null stage fields before any arithmetic (auto-unboxing would NPE otherwise)
+        for (StageDto stage : request.getStages()) {
+            if (stage.getStageNumber() == null) {
+                throw new BadRequestException("Stage number is required for every stage");
+            }
+            if (stage.getAmountToRelease() == null) {
+                throw new BadRequestException("Stage amount is required for stage " + stage.getStageNumber());
+            }
+        }
+
+        // Validate sum of amounts
+        BigDecimal totalConfiguredAmount = request.getStages().stream()
+                .map(StageDto::getAmountToRelease)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        if (totalConfiguredAmount.compareTo(plan.getTotalAmount()) != 0) {
+            throw new BadRequestException("The sum of stage amounts (₹" + totalConfiguredAmount
+                    + ") does not equal the total approved grant (₹" + plan.getTotalAmount() + ")");
+        }
+
+        // Fetch existing milestones
+        List<DisbursementMilestone> existingMilestones = milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+        boolean hasCompletedOrReleased = existingMilestones.stream()
+                .anyMatch(m -> m.getCompletionStatus() == MilestoneStatus.COMPLETED
+                            || m.getCompletionStatus() == MilestoneStatus.RELEASED
+                            || m.getCompletionStatus() == MilestoneStatus.OVERDUE);
+
+        if (hasCompletedOrReleased) {
+            throw new BadRequestException("Cannot reconfigure disbursement plan since some stages are already completed, overdue, or released");
+        }
+
+        // Clear existing milestones if any
+        if (!existingMilestones.isEmpty()) {
+            milestoneRepo.deleteAll(existingMilestones);
+        }
+
+        // Save new milestones
+        List<DisbursementMilestone> savedMilestones = new ArrayList<>();
+        for (StageDto stage : request.getStages()) {
+            if (stage.getAmountToRelease().compareTo(BigDecimal.ZERO) <= 0) {
+                throw new BadRequestException("Stage amount must be greater than zero");
+            }
+            if (stage.getStageNumber() <= 0) {
+                throw new BadRequestException("Stage number must be greater than zero");
+            }
+
+            // Milestone 1 (Initial Documentation Submitted) is released immediately on plan activation
+            // This means it is already COMPLETED upon configuration and ready for release
+            MilestoneStatus status = (stage.getStageNumber() == 1) ? MilestoneStatus.COMPLETED : MilestoneStatus.PENDING;
+            LocalDate completedDate = (stage.getStageNumber() == 1) ? LocalDate.now() : null;
+
+            DisbursementMilestone milestone = DisbursementMilestone.builder()
+                    .plan(plan)
+                    .stageNumber(stage.getStageNumber())
+                    .milestoneName(stage.getMilestoneName())
+                    .amountToRelease(stage.getAmountToRelease())
+                    .dueDate(stage.getDueDate())
+                    .completionStatus(status)
+                    .completedDate(completedDate)
+                    .build();
+
+            savedMilestones.add(milestoneRepo.save(milestone));
+        }
+
+
+        // Automatically release Stage 1 after the Finance Officer finalizes the plan.
+        savedMilestones.stream()
+            .filter(m -> m.getStageNumber() == 1)
+            .findFirst()
+            .ifPresent(stage1 -> {
+                System.out.println(">>> AUTO RELEASE START: milestone=" + stage1.getMilestoneId());
+
+                try {
+                    releaseMilestone(stage1.getMilestoneId());
+                    System.out.println(">>> AUTO RELEASE SUCCESS");
+                } catch (Exception e) {
+                    System.out.println(">>> AUTO RELEASE FAILED: " + e.getMessage());
+                    e.printStackTrace();
+                throw e;
+                }
+            });
+
+        List<DisbursementMilestone> refreshed = milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+        return mapToPlanResponse(plan, refreshed);
+    }
+
+    @Override
+    @Transactional
+    public DisbursementMilestoneResponse submitProof(Long milestoneId, com.example.gov_scheme_backend.dto.request.disbursement.MilestoneProofSubmitRequest request) {
+        DisbursementMilestone milestone = milestoneRepo.findById(milestoneId)
+                .orElseThrow(() -> new ResourceNotFoundException("Milestone not found with ID: " + milestoneId));
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.RELEASED) {
+            throw new BadRequestException("Milestone has already been released");
+        }
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.COMPLETED) {
+            throw new BadRequestException("Milestone proof has already been approved and is ready for release");
+        }
+
+        DisbursementPlan plan = milestone.getPlan();
+        List<DisbursementMilestone> allMilestones = milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+        for (DisbursementMilestone m : allMilestones) {
+            if (m.getStageNumber() < milestone.getStageNumber() && m.getCompletionStatus() != MilestoneStatus.RELEASED) {
+                throw new BadRequestException("Cannot submit proof for Stage " + milestone.getStageNumber()
+                        + " until Stage " + m.getStageNumber() + " is released.");
+            }
+        }
+
+        Application application = applicationRepo.findById(plan.getApplicationId())
+                .orElseThrow(() -> new ResourceNotFoundException("Application not found for disbursement plan"));
+
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        Users performer = null;
+        if (auth != null && auth.getName() != null && !"anonymousUser".equalsIgnoreCase(auth.getName())) {
+            performer = userRepo.findByUsername(auth.getName()).orElse(null);
+        }
+
+        if (request != null && request.getProofDocumentUrl() != null && !request.getProofDocumentUrl().isBlank()) {
+            ApplicationDocument proofDoc = new ApplicationDocument();
+            proofDoc.setApplication(application);
+            proofDoc.setDocumentType(com.example.gov_scheme_backend.enums.DocumentType.STAGE_COMPLIANCE_PROOF);
+            String docName = (request.getFileName() != null && !request.getFileName().isBlank())
+                    ? request.getFileName()
+                    : "Stage " + milestone.getStageNumber() + " Proof - " + milestone.getMilestoneName();
+            proofDoc.setFileName(docName);
+            proofDoc.setFilePath("");
+            proofDoc.setVerified(false);
+            proofDoc.setDocumentUrl(request.getProofDocumentUrl());
+
+            if (application.getDocuments() == null) {
+                application.setDocuments(new ArrayList<>());
+            }
+            application.getDocuments().add(proofDoc);
+            applicationRepo.save(application);
+        }
+
+        milestone.setCompletionStatus(MilestoneStatus.PROOF_SUBMITTED);
+        DisbursementMilestone saved = milestoneRepo.save(milestone);
+
+        String notesDesc = (request != null && request.getNotes() != null && !request.getNotes().isBlank()) ? " | Notes: " + request.getNotes() : "";
+        String docDesc = (request != null && request.getProofDocumentUrl() != null && !request.getProofDocumentUrl().isBlank()) ? " | Document: " + request.getProofDocumentUrl() : "";
+        AuditLog audit = AuditLog.builder()
+                .auditId(UUID.randomUUID().toString())
+                .user(performer != null ? performer : application.getUser())
+                .action(AuditAction.UPDATE)
+                .description("Stage " + milestone.getStageNumber() + " (" + milestone.getMilestoneName()
+                        + ") proof submitted for application " + application.getApplicationCode() + notesDesc + docDesc)
+                .build();
+        auditLogRepo.save(audit);
+
+        Users reviewingOfficer = application.getAllocatedOfficer();
+        if (reviewingOfficer == null) {
+            reviewingOfficer = userRepo.findByRole(Role.FIELD_OFFICER).stream().findFirst().orElse(null);
+        }
+        if (reviewingOfficer != null) {
+            notificationService.createAndPublishNotification(
+                    reviewingOfficer,
+                    "Beneficiary " + (application.getUser() != null ? application.getUser().getFullName() : "")
+                            + " submitted stage proof for Milestone '" + milestone.getMilestoneName()
+                            + "' (Stage " + milestone.getStageNumber() + ") of application " + application.getApplicationCode() + ".",
+                    NotificationType.APPLICATION_ASSIGNED,
+                    milestone.getMilestoneId(),
+                    application.getId()
+            );
+        }
+
+        return mapToMilestoneResponse(saved, application, request != null ? request.getNotes() : null);
+    }
+
+    @Override
+    @Transactional
+    public DisbursementMilestoneResponse rejectProof(Long milestoneId, com.example.gov_scheme_backend.dto.request.disbursement.MilestoneProofRejectRequest request) {
+        DisbursementMilestone milestone = milestoneRepo.findById(milestoneId)
+                .orElseThrow(() -> new ResourceNotFoundException("Milestone not found with ID: " + milestoneId));
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.RELEASED) {
+            throw new BadRequestException("Milestone is already released and cannot be rejected");
+        }
+
+        String reason = (request != null && request.getReason() != null && !request.getReason().isBlank())
+                ? request.getReason()
+                : "Proof verification failed. Please provide compliant documentation.";
+
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        Users performer = null;
+        if (auth != null && auth.getName() != null && !"anonymousUser".equalsIgnoreCase(auth.getName())) {
+            performer = userRepo.findByUsername(auth.getName()).orElse(null);
+            if (performer != null) {
+                Role role = performer.getRole();
+                boolean isOfficer = role == Role.FIELD_OFFICER || role == Role.DISTRICT_OFFICER || role == Role.REGIONAL_OFFICER || role == Role.FINANCE_OFFICER || role == Role.ADMIN;
+                if (!isOfficer) {
+                    throw new BadRequestException("Only an authorized officer can reject stage proofs");
+                }
+            }
+        }
+
+        milestone.setCompletionStatus(MilestoneStatus.PROOF_REJECTED);
+        DisbursementMilestone saved = milestoneRepo.save(milestone);
+
+        Application application = applicationRepo.findById(milestone.getPlan().getApplicationId()).orElse(null);
+        if (application != null) {
+            AuditLog audit = AuditLog.builder()
+                    .auditId(UUID.randomUUID().toString())
+                    .user(performer)
+                    .action(AuditAction.REJECT)
+                    .description("Stage " + milestone.getStageNumber() + " (" + milestone.getMilestoneName()
+                            + ") proof rejected for application " + application.getApplicationCode() + ". Reason: " + reason)
+                    .build();
+            auditLogRepo.save(audit);
+
+            if (application.getUser() != null) {
+                notificationService.createAndPublishNotification(
+                        application.getUser(),
+                        "Stage " + milestone.getStageNumber() + " (" + milestone.getMilestoneName()
+                                + ") proof requires revision: " + reason + ". Please resubmit compliant evidence.",
+                        NotificationType.APPLICATION_RE_VERIFY,
+                        milestone.getMilestoneId(),
+                        application.getId()
+                );
+            }
+        }
+
+        return mapToMilestoneResponse(saved, application, null);
+    }
+
+    @Override
+    @Transactional
+    public DisbursementMilestoneResponse completeMilestone(Long milestoneId) {
+        DisbursementMilestone milestone = milestoneRepo.findById(milestoneId)
+                .orElseThrow(() -> new ResourceNotFoundException("Milestone not found with ID: " + milestoneId));
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.RELEASED) {
+            throw new BadRequestException("Milestone is already released");
+        }
+
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        Users performer = null;
+        if (auth != null && auth.getName() != null && !"anonymousUser".equalsIgnoreCase(auth.getName())) {
+            performer = userRepo.findByUsername(auth.getName()).orElse(null);
+            if (performer != null) {
+                Role role = performer.getRole();
+                boolean isOfficer = role == Role.FIELD_OFFICER || role == Role.DISTRICT_OFFICER || role == Role.REGIONAL_OFFICER || role == Role.FINANCE_OFFICER || role == Role.ADMIN;
+                if (!isOfficer) {
+                    throw new BadRequestException("Only an authorized officer can approve and complete milestone proofs");
+                }
+            }
+        }
+
+        milestone.setCompletionStatus(MilestoneStatus.COMPLETED);
+        milestone.setCompletedDate(LocalDate.now());
+        DisbursementMilestone saved = milestoneRepo.save(milestone);
+
+        Application application = null;
+        if (milestone.getPlan() != null && milestone.getPlan().getApplicationId() != null) {
+            application = applicationRepo.findById(milestone.getPlan().getApplicationId()).orElse(null);
+        }
+
+        if (application != null) {
+            // Mark any stage compliance document as verified
+            if (application.getDocuments() != null) {
+                for (ApplicationDocument doc : application.getDocuments()) {
+                    if (doc.getDocumentType() == com.example.gov_scheme_backend.enums.DocumentType.STAGE_COMPLIANCE_PROOF
+                            && doc.getFileName() != null && doc.getFileName().contains("Stage " + milestone.getStageNumber())) {
+                        doc.setVerified(true);
+                    }
+                }
+                applicationRepo.save(application);
+            }
+
+            AuditLog audit = AuditLog.builder()
+                    .auditId(UUID.randomUUID().toString())
+                    .user(performer)
+                    .action(AuditAction.APPROVE)
+                    .description("Approved stage compliance proof for milestone: " + milestone.getMilestoneName()
+                            + " (Stage " + milestone.getStageNumber() + ") for Application ID: " + application.getId())
+                    .build();
+            auditLogRepo.save(audit);
+        }
+
+        notifyFinanceOfficerMilestoneReady(saved);
+
+        return mapToMilestoneResponse(saved, application, null);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public DisbursementMilestoneResponse releaseMilestone(Long milestoneId) {
+        DisbursementMilestone milestone = milestoneRepo.findById(milestoneId)
+                .orElseThrow(() -> new ResourceNotFoundException("Milestone not found with ID: " + milestoneId));
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.RELEASED) {
+            throw new BadRequestException("Milestone is already released");
+        }
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.PENDING || milestone.getCompletionStatus() == MilestoneStatus.PROOF_SUBMITTED || milestone.getCompletionStatus() == MilestoneStatus.PROOF_REJECTED) {
+            throw new BadRequestException("Milestone status is " + milestone.getCompletionStatus() + " and must be COMPLETED before release");
+        }
+
+        if (milestone.getCompletionStatus() == MilestoneStatus.OVERDUE) {
+            throw new BadRequestException("Milestone status is OVERDUE and must be resolved by an admin before release");
+        }
+
+        // Sequential Block check & Overdue block checks
+        DisbursementPlan plan = milestone.getPlan();
+        List<DisbursementMilestone> allMilestones = milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+        for (DisbursementMilestone m : allMilestones) {
+            if (m.getStageNumber() < milestone.getStageNumber()) {
+                if (m.getCompletionStatus() == MilestoneStatus.OVERDUE) {
+                    throw new BadRequestException("Stage " + milestone.getStageNumber()
+                            + " release is blocked because Stage " + m.getStageNumber() + " is OVERDUE.");
+                }
+                if (m.getCompletionStatus() != MilestoneStatus.RELEASED) {
+                    throw new BadRequestException("Stage " + milestone.getStageNumber()
+                            + " cannot be released until Stage " + m.getStageNumber() + " has been released.");
+                }
+            }
+        }
+
+        // 1. Update milestone status
+        milestone.setCompletionStatus(MilestoneStatus.RELEASED);
+        milestone.setAmountReleased(milestone.getAmountToRelease());
+        milestone.setReleaseDate(LocalDate.now());
+        milestoneRepo.save(milestone);
+
+        // 2. Update scheme budget (guard against over-disbursing beyond allocated funds)
+        Application application = applicationRepo.findById(milestone.getPlan().getApplicationId())
+                .orElseThrow(() -> new ResourceNotFoundException("Application not found for disbursement plan"));
+        Schemes scheme = application.getScheme();
+        BigDecimal currentBudgetUsed = scheme.getBudgetUsed();
+        BigDecimal releaseAmount = milestone.getAmountToRelease();
+        BigDecimal allocatedFunds = scheme.getAllocatedFunds();
+
+        if (allocatedFunds != null && currentBudgetUsed.add(releaseAmount).compareTo(allocatedFunds) > 0) {
+            throw new BadRequestException("Releasing ₹" + releaseAmount
+                    + " would exceed the scheme's allocated funds (already used ₹" + currentBudgetUsed
+                    + " of ₹" + allocatedFunds + ").");
+        }
+        scheme.setBudgetUsed(currentBudgetUsed.add(releaseAmount));
+        schemeRepo.save(scheme);
+
+        // 3. Write Audit Log
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String username = auth != null ? auth.getName() : null;
+        Users performer = null;
+        if (username != null) {
+            performer = userRepo.findByUsername(username).orElse(null);
+        }
+
+        AuditLog audit = AuditLog.builder()
+                .auditId(UUID.randomUUID().toString())
+                .user(performer)
+                .action(AuditAction.DISBURSE)
+                .description("Released milestone: " + milestone.getMilestoneName() + " (Stage " + milestone.getStageNumber()
+                        + ", Amount: ₹" + milestone.getAmountToRelease() + ") for Application ID: " + application.getId())
+                .build();
+        auditLogRepo.save(audit);
+
+        // 4. Notify the beneficiary that funds have been disbursed for this milestone
+        if (application.getUser() != null) {
+            notificationService.createAndPublishNotification(
+                    application.getUser(),
+                    "₹" + milestone.getAmountToRelease() + " has been disbursed for milestone '"
+                            + milestone.getMilestoneName() + "' (Stage " + milestone.getStageNumber()
+                            + ") of your subsidy application " + application.getApplicationCode() + ".",
+                    NotificationType.DISBURSEMENT_RELEASED,
+                    milestone.getMilestoneId(),
+                    application.getId()
+            );
+        }
+
+        // 5. Check if all milestones are released -> transition application to DISBURSED
+        boolean allReleased = allMilestones.stream()
+                .allMatch(m -> m.getMilestoneId().equals(milestone.getMilestoneId())
+                        || m.getCompletionStatus() == MilestoneStatus.RELEASED);
+
+        if (allReleased) {
+            application.setStatus(ApplicationStatus.DISBURSED);
+            applicationRepo.save(application);
+
+            if (workflowRepository != null) {
+                try {
+                    VerificationWorkflow workflow = workflowRepository.findByApplicationId(application.getId()).orElse(null);
+                    if (workflow != null) {
+                        workflow.setCurrentStage(com.example.gov_scheme_backend.enums.WorkflowStage.COMPLETED);
+                        workflowRepository.save(workflow);
+                    }
+                } catch (Exception ignored) { }
+            }
+
+            if (application.getUser() != null) {
+                notificationService.createAndPublishNotification(
+                        application.getUser(),
+                        "All disbursement milestones have been successfully released for your application "
+                                + application.getApplicationCode() + ". Your application status is now DISBURSED.",
+                        NotificationType.DISBURSEMENT_RELEASED,
+                        milestone.getMilestoneId(),
+                        application.getId()
+                );
+            }
+        }
+
+        return mapToMilestoneResponse(milestone, application, null);
+    }
+
+    @Override
+    public DisbursementPlanResponse getPlanByApplication(Long applicationId) {
+        DisbursementPlan plan = planRepo.findByApplicationId(applicationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Disbursement plan not found for Application ID: " + applicationId));
+
+        List<DisbursementMilestone> milestones = milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+        return mapToPlanResponse(plan, milestones);
+    }
+
+    @Override
+    public DisbursementPlanResponse getPlanById(Long planId) {
+        DisbursementPlan plan = planRepo.findById(planId)
+                .orElseThrow(() -> new ResourceNotFoundException("Disbursement plan not found for Plan ID: " + planId));
+
+        List<DisbursementMilestone> milestones = milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+        return mapToPlanResponse(plan, milestones);
+    }
+
+    @Override
+    @Transactional
+    public void sendUpcomingReminders() {
+        LocalDate today = LocalDate.now();
+        LocalDate threeDaysLater = today.plusDays(3);
+
+        List<DisbursementMilestone> upcomingPending = milestoneRepo.findByCompletionStatusAndDueDateBetween(
+                MilestoneStatus.PENDING, today, threeDaysLater);
+
+        for (DisbursementMilestone m : upcomingPending) {
+            // Idempotency check: if reminder sent today, skip
+            if (notificationRepo.existsByMilestoneIdAndSentDate(m.getMilestoneId(), today)) {
+                continue;
+            }
+
+            Application app = applicationRepo.findById(m.getPlan().getApplicationId()).orElse(null);
+            if (app != null && app.getUser() != null) {
+                Users beneficiary = app.getUser();
+                String messageText = "Reminder: Your subsidy milestone '" + m.getMilestoneName()
+                        + "' (Stage " + m.getStageNumber() + ") is due on " + m.getDueDate()
+                        + ". Please submit utilization/documents to avoid blockages.";
+
+                notificationService.createAndPublishNotification(
+                        beneficiary,
+                        messageText,
+                        NotificationType.REMINDER,
+                        m.getMilestoneId(),
+                        app.getId()
+                );
+            }
+        }
+    }
+
+    @Override
+    @Transactional
+    public void flagOverdueMilestones() {
+        LocalDate today = LocalDate.now();
+
+        List<DisbursementMilestone> overduePending = milestoneRepo.findByCompletionStatusAndDueDateBefore(
+                MilestoneStatus.PENDING, today);
+
+        for (DisbursementMilestone m : overduePending) {
+            // Update status to OVERDUE
+            m.setCompletionStatus(MilestoneStatus.OVERDUE);
+            milestoneRepo.save(m);
+
+            // Audit Log
+            AuditLog audit = AuditLog.builder()
+                    .auditId(UUID.randomUUID().toString())
+                    .action(AuditAction.UPDATE)
+                    .description("Milestone marked as OVERDUE: " + m.getMilestoneName()
+                            + " (Stage " + m.getStageNumber() + ", Due Date: " + m.getDueDate() + ")")
+                    .build();
+            auditLogRepo.save(audit);
+
+            // Notify the beneficiary that this milestone is now overdue. This is
+            // naturally idempotent: a milestone transitions PENDING -> OVERDUE
+            // exactly once (the query only selects PENDING rows), so the
+            // notification fires at most once per milestone — no duplicate guard
+            // needed.
+            Application overdueApp = applicationRepo.findById(m.getPlan().getApplicationId()).orElse(null);
+            if (overdueApp != null && overdueApp.getUser() != null) {
+                notificationService.createAndPublishNotification(
+                        overdueApp.getUser(),
+                        "Your subsidy milestone '" + m.getMilestoneName() + "' (Stage "
+                                + m.getStageNumber() + ") is overdue (was due on " + m.getDueDate()
+                                + "). Please submit the required documents as soon as possible.",
+                        NotificationType.MILESTONE_OVERDUE,
+                        m.getMilestoneId(),
+                        overdueApp.getId()
+                );
+            }
+        }
+    }
+
+    @Override
+    @Transactional
+    public DisbursementMilestoneResponse resolveMilestone(Long milestoneId, String reason) {
+        if (reason == null || reason.trim().isEmpty()) {
+            throw new BadRequestException("Resolution reason is mandatory");
+        }
+
+        DisbursementMilestone milestone = milestoneRepo.findById(milestoneId)
+                .orElseThrow(() -> new ResourceNotFoundException("Milestone not found with ID: " + milestoneId));
+
+        if (milestone.getCompletionStatus() != MilestoneStatus.OVERDUE) {
+            throw new BadRequestException("Milestone status is " + milestone.getCompletionStatus()
+                    + ", only OVERDUE milestones can be resolved by admin override.");
+        }
+
+        // Update status to COMPLETED
+        milestone.setCompletionStatus(MilestoneStatus.COMPLETED);
+        milestone.setCompletedDate(LocalDate.now());
+        milestone.setResolvedReason(reason);
+        milestone.setResolvedDate(LocalDate.now());
+        milestoneRepo.save(milestone);
+
+        // Audit Log
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String username = auth != null ? auth.getName() : null;
+        Users performer = null;
+        if (username != null) {
+            performer = userRepo.findByUsername(username).orElse(null);
+        }
+
+        AuditLog audit = AuditLog.builder()
+                .auditId(UUID.randomUUID().toString())
+                .user(performer)
+                .action(AuditAction.UPDATE)
+                .description("Admin Override Resolution: OVERDUE milestone ID " + milestoneId
+                        + " resolved. Reason: " + reason)
+                .build();
+        auditLogRepo.save(audit);
+
+        return mapToMilestoneResponse(milestone);
+    }
+
+    @Override
+    public List<OverdueMilestoneResponse> getOverdueMilestonesReport() {
+        List<DisbursementMilestone> overdueMilestones = milestoneRepo.findByCompletionStatus(MilestoneStatus.OVERDUE);
+
+        List<OverdueMilestoneResponse> responses = new ArrayList<>();
+        LocalDate today = LocalDate.now();
+
+        for (DisbursementMilestone m : overdueMilestones) {
+            Application app = applicationRepo.findById(m.getPlan().getApplicationId()).orElse(null);
+            String beneficiaryName = (app != null && app.getUser() != null) ? app.getUser().getFullName() : "Unknown";
+            String schemeName = (app != null && app.getScheme() != null) ? app.getScheme().getSchemeName() : "Unknown";
+            long daysOverdue = ChronoUnit.DAYS.between(m.getDueDate(), today);
+
+            responses.add(OverdueMilestoneResponse.builder()
+                    .milestoneId(m.getMilestoneId())
+                    .beneficiaryName(beneficiaryName)
+                    .schemeName(schemeName)
+                    .milestoneName(m.getMilestoneName())
+                    .dueDate(m.getDueDate())
+                    .daysOverdue(daysOverdue)
+                    .build());
+        }
+
+        return responses;
+    }
+
+    @Override
+    public List<Notification> getUserNotifications(String username) {
+        Users user = userRepo.findByUsername(username)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with username: " + username));
+
+        return notificationRepo.findByUserOrderBySentDateDesc(user);
+    }
+
+    @Override
+    @Transactional
+    public DisbursementPlanResponse seedData() {
+        // Seed Category
+        SchemeCategory category = schemeCategoryRepository.findByCategoryName("Agriculture")
+                .orElseGet(() -> {
+                    SchemeCategory cat = new SchemeCategory();
+                    cat.setCategoryName("Agriculture");
+                    cat.setDescription("Agriculture Subsidy Schemes");
+                    cat.setActive(true);
+                    return schemeCategoryRepository.save(cat);
+                });
+
+        // Seed Scheme
+        Schemes scheme = schemeRepo.findBySchemeCode("SCH-TEST")
+                .orElseGet(() -> {
+                    Schemes s = new Schemes();
+                    s.setSchemeCode("SCH-TEST");
+                    s.setSchemeName("Prime Minister Agriculture Grant");
+                    s.setDescription("Assistance for modern agricultural tools.");
+                    s.setAllocatedFunds(new BigDecimal("250000.00"));
+                    s.setMinimumEligibleScore(50.0);
+                    s.setActive(true);
+                    s.setCategory(category);
+                    s.setBudgetUsed(BigDecimal.ZERO);
+                    return schemeRepo.save(s);
+                });
+
+        // Seed User
+        Users user = userRepo.findByUsername("farmer1").orElse(null);
+        if (user == null) {
+            user = new Users();
+            user.setUniqueID("UID-9912093");
+            user.setFullName("Ramesh Kumar");
+            user.setUsername("farmer1");
+            // encrypted "password"
+            user.setPassword("$2a$10$8.ZTR5888/z8kPh6.t69K.7Ydoxz3u.D0h2l8z0Y6wB5bW0y6v34u");
+            user.setRole(Role.BENEFICIARY);
+            user.setRegion("North");
+            user.setDistrict("North Delhi");
+            user.setState("Delhi");
+            user.setMobileNo("9811223344");
+            user = userRepo.save(user);
+        }
+
+        // Seed Application
+        Optional<Application> existingAppOpt = applicationRepo.findAll().stream()
+                .filter(a -> a.getUser().getId().equals(userRepo.findByUsername("farmer1").get().getId())
+                          && a.getScheme().getSchemeCode().equals("SCH-TEST"))
+                .findFirst();
+
+        Application application;
+        if (existingAppOpt.isPresent()) {
+            application = existingAppOpt.get();
+        } else {
+            application = new Application();
+            application.setUser(user);
+            application.setScheme(scheme);
+            application.setApplicationCode("APP-TEST-DISB");
+            application.setStatus(ApplicationStatus.APPROVED);
+            application.setRemarks("Pre-approved for testing disbursement milestone tracking");
+            application = applicationRepo.save(application);
+        }
+
+        // Seed Plan
+        final Long appId = application.getId();
+
+        DisbursementPlan plan = planRepo.findByApplicationId(appId).orElse(null);
+
+        if (plan != null) {
+            // Reset existing plan data for clean sandbox execution
+            List<DisbursementMilestone> existingMilestones =
+                    milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+
+            milestoneRepo.deleteAll(existingMilestones);
+            notificationRepo.deleteAll();
+            auditLogRepo.deleteAll();
+        } else {
+            plan = DisbursementPlan.builder()
+                    .applicationId(appId)
+                    .totalAmount(new BigDecimal("50000.00"))
+                    .totalStages(3)
+                    .build();
+
+            plan = planRepo.save(plan);
+        }
+
+        // Seed milestones
+        List<DisbursementMilestone> seedMilestones = List.of(
+
+                DisbursementMilestone.builder()
+                        .plan(plan)
+                        .stageNumber(1)
+                        .milestoneName("Initial Release")
+                        .amountToRelease(new BigDecimal("20000.00"))
+                        .dueDate(LocalDate.now())
+                        .completionStatus(MilestoneStatus.COMPLETED)
+                        .completedDate(LocalDate.now())
+                        .amountReleased(new BigDecimal("20000.00"))
+                        .releaseDate(LocalDate.now())
+                        .build(),
+
+                DisbursementMilestone.builder()
+                        .plan(plan)
+                        .stageNumber(2)
+                        .milestoneName("Second Stage")
+                        .amountToRelease(new BigDecimal("15000.00"))
+                        .dueDate(LocalDate.now().plusDays(30))
+                        .completionStatus(MilestoneStatus.PENDING)
+                        .amountReleased(BigDecimal.ZERO)
+                        .build(),
+
+                DisbursementMilestone.builder()
+                        .plan(plan)
+                        .stageNumber(3)
+                        .milestoneName("Final Release")
+                        .amountToRelease(new BigDecimal("15000.00"))
+                        .dueDate(LocalDate.now().plusDays(60))
+                        .completionStatus(MilestoneStatus.PENDING)
+                        .amountReleased(BigDecimal.ZERO)
+                        .build()
+        );
+
+        milestoneRepo.saveAll(seedMilestones);
+
+        List<DisbursementMilestone> milestones =
+                milestoneRepo.findByPlanOrderByStageNumberAsc(plan);
+
+        return mapToPlanResponse(plan, milestones);
+    }
+
+    private void notifyFinanceOfficerMilestoneReady(DisbursementMilestone milestone) {
+
+        DisbursementPlan plan = milestone.getPlan();
+
+        Users financeOfficer = null;
+        if (plan.getFinanceOfficerId() != null) {
+            financeOfficer = userRepo.findById(plan.getFinanceOfficerId()).orElse(null);
+        }
+        if (financeOfficer == null) {
+            // Fallback for plans created before this field existed, or if the
+            // originally-assigned officer no longer exists.
+            financeOfficer = userRepo.findByRole(Role.FINANCE_OFFICER)
+                    .stream()
+                    .findFirst()
+                    .orElse(null);
+        }
+        if (financeOfficer == null) {
+            return; // nobody to notify — skip silently, don't block milestone completion
+        }
+
+        Application app = applicationRepo.findById(plan.getApplicationId()).orElse(null);
+        String beneficiaryName = (app != null && app.getUser() != null) ? app.getUser().getFullName() : "Unknown";
+        String applicationCode = (app != null) ? app.getApplicationCode() : "N/A";
+
+        String message = "Milestone '" + milestone.getMilestoneName() + "' (Stage "
+                + milestone.getStageNumber() + ") for " + beneficiaryName + "'s application "
+                + applicationCode + " is complete and ready for disbursement of ₹"
+                + milestone.getAmountToRelease() + ".";
+
+        notificationService.createAndPublishNotification(
+                financeOfficer,
+                message,
+                NotificationType.MILESTONE_READY,
+                milestone.getMilestoneId(),
+                plan.getApplicationId()
+        );
+    }
+
+    @Override
+    public SuggestedStagesResponse suggestStages(Long planId) {
+
+        DisbursementPlan plan = planRepo.findById(planId)
+                .orElseThrow(() -> new ResourceNotFoundException("Disbursement plan not found with ID: " + planId));
+
+        int n = plan.getTotalStages();
+        BigDecimal total = plan.getTotalAmount();
+
+        // Even split, rounded down to 2 decimals per stage; the last stage
+        // absorbs the rounding remainder so the sum always equals the total
+        // exactly (required by configurePlan's validation).
+        BigDecimal nDec = new BigDecimal(n);
+        BigDecimal baseAmount = total.divide(nDec, 2, RoundingMode.FLOOR);
+        BigDecimal allocatedToFirstStages = baseAmount.multiply(new BigDecimal(n - 1));
+        BigDecimal lastStageAmount = total.subtract(allocatedToFirstStages);
+
+        List<StageDto> stages = new ArrayList<>();
+        LocalDate today = LocalDate.now();
+
+        for (int i = 1; i <= n; i++) {
+            BigDecimal amount = (i == n) ? lastStageAmount : baseAmount;
+            String name = (i == 1) ? "Initial Release" : (i == n) ? "Final Release" : "Stage " + i + " Release";
+            // Stage 1 is due today since it releases immediately on finalization;
+            // later stages are spaced 30 days apart as a starting suggestion —
+            // the officer can edit every due date before finalizing.
+            LocalDate dueDate = (i == 1) ? today : today.plusDays(30L * (i - 1));
+
+            stages.add(new StageDto(i, name, amount, dueDate));
+        }
+
+        return SuggestedStagesResponse.builder()
+                .planId(plan.getPlanId())
+                .totalAmount(total)
+                .totalStages(n)
+                .suggestedStages(stages)
+                .build();
+    }
+
+    @Override
+    public MilestoneContextResponse getMilestoneContext(Long milestoneId) {
+
+        DisbursementMilestone milestone = milestoneRepo.findById(milestoneId)
+                .orElseThrow(() -> new ResourceNotFoundException("Milestone not found with ID: " + milestoneId));
+
+        DisbursementPlan plan = milestone.getPlan();
+        Application app = applicationRepo.findById(plan.getApplicationId())
+                .orElseThrow(() -> new ResourceNotFoundException("Application not found for disbursement plan"));
+
+        List<DisbursementMilestoneResponse> allMilestones = milestoneRepo
+                .findByPlanOrderByStageNumberAsc(plan)
+                .stream()
+                .map(this::mapToMilestoneResponse)
+                .collect(Collectors.toList());
+
+        return MilestoneContextResponse.builder()
+                .milestoneId(milestone.getMilestoneId())
+                .stageNumber(milestone.getStageNumber())
+                .milestoneName(milestone.getMilestoneName())
+                .amountToRelease(milestone.getAmountToRelease())
+                .dueDate(milestone.getDueDate())
+                .completionStatus(milestone.getCompletionStatus())
+                .completedDate(milestone.getCompletedDate())
+                .planId(plan.getPlanId())
+                .applicationId(app.getId())
+                .applicationCode(app.getApplicationCode())
+                .beneficiaryName(app.getUser() != null ? app.getUser().getFullName() : "Unknown")
+                .schemeName(app.getScheme() != null ? app.getScheme().getSchemeName() : "Unknown")
+                .allMilestones(allMilestones)
+                .build();
+    }
+
+    private DisbursementPlanResponse mapToPlanResponse(DisbursementPlan plan, List<DisbursementMilestone> milestones) {
+        List<DisbursementMilestoneResponse> milestoneResponses = milestones.stream()
+                .map(this::mapToMilestoneResponse)
+                .collect(Collectors.toList());
+
+        return DisbursementPlanResponse.builder()
+                .planId(plan.getPlanId())
+                .applicationId(plan.getApplicationId())
+                .totalAmount(plan.getTotalAmount())
+                .totalStages(plan.getTotalStages())
+                .milestones(milestoneResponses)
+                .build();
+    }
+
+    private DisbursementMilestoneResponse mapToMilestoneResponse(DisbursementMilestone milestone) {
+        return mapToMilestoneResponse(milestone, null, null);
+    }
+
+    private DisbursementMilestoneResponse mapToMilestoneResponse(DisbursementMilestone milestone, Application app, String notes) {
+        String proofUrl = null;
+        String fileName = null;
+
+        if (app == null && milestone.getPlan() != null && milestone.getPlan().getApplicationId() != null) {
+            try {
+                app = applicationRepo.findById(milestone.getPlan().getApplicationId()).orElse(null);
+            } catch (Exception ignored) { }
+        }
+
+        if (app != null && app.getDocuments() != null) {
+            for (ApplicationDocument doc : app.getDocuments()) {
+                if (doc.getDocumentType() == com.example.gov_scheme_backend.enums.DocumentType.STAGE_COMPLIANCE_PROOF) {
+                    if (doc.getFileName() != null && doc.getFileName().contains("Stage " + milestone.getStageNumber())) {
+                        proofUrl = doc.getDocumentUrl();
+                        fileName = doc.getFileName();
+                        break;
+                    }
+                }
+            }
+        }
+
+        return DisbursementMilestoneResponse.builder()
+                .milestoneId(milestone.getMilestoneId())
+                .stageNumber(milestone.getStageNumber())
+                .milestoneName(milestone.getMilestoneName())
+                .amountToRelease(milestone.getAmountToRelease())
+                .dueDate(milestone.getDueDate())
+                .completionStatus(milestone.getCompletionStatus())
+                .completedDate(milestone.getCompletedDate())
+                .amountReleased(milestone.getAmountReleased())
+                .releaseDate(milestone.getReleaseDate())
+                .resolvedReason(milestone.getResolvedReason())
+                .resolvedDate(milestone.getResolvedDate())
+                .proofDocumentUrl(proofUrl)
+                .fileName(fileName)
+                .proofNotes(notes)
+                .build();
+    }
+}

@@ -1,0 +1,1814 @@
+import '../../styles/Dashboard.css';
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { motion, AnimatePresence } from 'framer-motion'
+import DashboardTopbar from '../../components/DashboardTopbar'
+import ProfilePanel from '../../components/ProfilePanel'
+import { FaClipboardList, FaHourglassHalf, FaCheckCircle, FaTimesCircle, FaHome, FaChartLine, FaBell, FaUserCircle } from 'react-icons/fa'
+import api from '../../services/api'
+import { 
+  getMyApplications, 
+  getDisbursementPlan, 
+  configureDisbursementPlan, 
+  completeMilestone,
+  rejectProof,
+  releaseMilestone,
+  resolveMilestone,
+  getOverdueMilestones,
+  getNotifications,
+  updateApprovalStatus,
+  getInspectionContext,
+  submitInspectionReport,
+  uploadInspectionMedia,
+} from '../../services/officerService'
+import { clearPortalSessionCaches } from '../../services/sessionCleanup'
+import SchemeDashboard from '../scheme-dashboard'
+
+const STATUS_BADGE = {
+  Pending: 'badge-status--applied',
+  Approved: 'badge-status--eligible',
+  Rejected: 'badge-status--ineligible',
+  PENDING: 'badge-status--applied',
+  SUBMITTED: 'badge-status--applied',
+  UNDER_REVIEW: 'badge-status--applied',
+  FIELD_OFFICER: 'badge-status--applied',
+  DISTRICT_OFFICER: 'badge-status--applied',
+  REGIONAL_OFFICER: 'badge-status--applied',
+  FINANCE_OFFICER: 'badge-status--applied',
+  APPROVED: 'badge-status--eligible',
+  REJECTED: 'badge-status--ineligible',
+}
+
+function getApplicationId(app) {
+  return app?.id || app?.applicationId
+}
+
+function isOfficerAssignedToApp(officer, app) {
+  if (!officer || !app) return false
+  const officerDbId = officer.id
+  const officerUnique = officer.uniqueID || officer.uniqueId
+  const assignedDb = app.assignedOfficerDbId
+  const assignedUnique = app.assignedOfficerId
+  if (assignedDb != null && officerDbId != null && String(assignedDb) === String(officerDbId)) return true
+  if (assignedUnique != null && officerUnique != null && String(assignedUnique) === String(officerUnique)) return true
+  return false
+}
+
+function getMilestoneStatus(milestone) {
+  return String(milestone?.completionStatus || '').toUpperCase()
+}
+
+function getProofPendingMilestones(plan) {
+  return (plan?.milestones || []).filter((m) => getMilestoneStatus(m) === 'PROOF_SUBMITTED')
+}
+
+export default function OfficerDashboard() {
+  const navigate = useNavigate()
+
+  const [officer, setOfficer] = useState(null)
+  const [applications, setApplications] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState('home')
+  const [searchTerm, setSearchTerm] = useState('')
+  const [statusFilter, setStatusFilter] = useState('All')
+  const [selectedApp, setSelectedApp] = useState(null)
+  const [rejectMode, setRejectMode] = useState(false)
+  const [rejectReason, setRejectReason] = useState('')
+  const [toast, setToast] = useState(null)
+
+  const [activeDocTab, setActiveDocTab] = useState('aadhaar')
+  const [checklist, setChecklist] = useState({ address: false, business: false, assets: false })
+  const [fieldNotes, setFieldNotes] = useState('')
+
+  // Field Inspection states
+  const [uploadedMediaIds, setUploadedMediaIds] = useState([])          // [{ mediaId, url, fileName, uploading }]
+  const [, setInspectionLoading] = useState(false)      // pre-fill fetch
+  const [submittingInspection, setSubmittingInspection] = useState(false) // submit in flight
+  const [inspectionContext, setInspectionContext] = useState(null)        // context from backend
+
+  // Disbursement states
+  const [disbursementPlan, setDisbursementPlan] = useState(null)
+  const [showDisbursementManager, setShowDisbursementManager] = useState(false)
+  const [planConfigStages, setPlanConfigStages] = useState([])
+
+  // Task 2 compliance states
+  const [overdueReports, setOverdueReports] = useState([])
+  const [notifications, setNotifications] = useState([])
+  const [showResolveModal, setShowResolveModal] = useState(false)
+  const [resolvingMilestoneId, setResolvingMilestoneId] = useState(null)
+  const [resolvedReasonInput, setResolvedReasonInput] = useState('')
+  const [isResolving, setIsResolving] = useState(false)
+  const [proofRejectMilestone, setProofRejectMilestone] = useState(null)
+  const [proofRejectReason, setProofRejectReason] = useState('')
+  const [proofActionBusyId, setProofActionBusyId] = useState(null)
+  // Auth guard + fetch officer profile on mount
+  useEffect(() => {
+    async function init() {
+      try {
+        const res = await api.get('/gov/auth/profile/get')
+        if (res.data && res.data.status !== false) {
+          setOfficer(res.data.data || res.data)
+        } else {
+          navigate('/officer/login')
+          return
+        }
+      } catch {
+        navigate('/officer/login')
+        return
+      }
+
+      try {
+        const data = await getMyApplications()
+        setApplications(Array.isArray(data) ? data : data?.data || [])
+      } catch (err) {
+        console.error('Failed to load applications:', err.message)
+      } finally {
+        setLoading(false)
+      }
+    }
+    init()
+  }, [navigate])
+
+  const showToast = (message, type = 'success') => {
+    setToast({ message, type })
+    setTimeout(() => setToast(null), 3000)
+  }
+
+  const handleLogout = async () => {
+    try { await api.post('/gov/auth/signout') } catch { /* ignore */ }
+    clearPortalSessionCaches()
+    navigate('/officer/login')
+  }
+
+  // Statistics
+  const total = applications.length
+  const pending = applications.filter(a => {
+    const status = String(a.status || '').toUpperCase()
+    return status === 'PENDING'
+      || status === 'SUBMITTED'
+      || status === 'UNDER_REVIEW'
+      || status === 'FIELD_OFFICER'
+      || status === 'DISTRICT_OFFICER'
+      || status === 'REGIONAL_OFFICER'
+      || status === 'FINANCE_OFFICER'
+  }).length
+  const approved = applications.filter(a => a.status === 'Approved' || a.status === 'APPROVED').length
+  const rejected = applications.filter(a => a.status === 'Rejected' || a.status === 'REJECTED').length
+  const approvalRate = total ? Math.round((approved / total) * 100) : 0
+
+  const filteredApps = applications.filter(app => {
+    const term = searchTerm.toLowerCase()
+    const matchesSearch =
+      app.applicant?.toLowerCase().includes(term) ||
+      app.applicantName?.toLowerCase().includes(term) ||
+      (app.id || app.applicationId || '').toLowerCase().includes(term) ||
+      app.schemeName?.toLowerCase().includes(term)
+    const appStatus = app.status || ''
+    const normalizedFilter = statusFilter.toUpperCase()
+    const matchesStatus =
+      statusFilter === 'All' ||
+      (
+        normalizedFilter === 'PENDING'
+          ? ['PENDING', 'SUBMITTED', 'UNDER_REVIEW', 'FIELD_OFFICER', 'DISTRICT_OFFICER', 'REGIONAL_OFFICER', 'FINANCE_OFFICER'].includes(appStatus.toUpperCase())
+          : appStatus.toUpperCase() === normalizedFilter
+      )
+    return matchesSearch && matchesStatus
+  })
+
+  const openApplication = async (app) => {
+    setSelectedApp(app)
+    setRejectMode(false)
+    setRejectReason('')
+    setProofRejectMilestone(null)
+    setProofRejectReason('')
+    setDisbursementPlan(null)
+    // Reset inspection state
+    setChecklist({ address: false, business: false, assets: false })
+    setFieldNotes('')
+    setUploadedMediaIds([])
+    setInspectionContext(null)
+
+    const appId = getApplicationId(app)
+    if (appId) {
+      try {
+        const plan = await getDisbursementPlan(appId)
+        setDisbursementPlan(plan)
+      } catch {
+        setDisbursementPlan(null)
+      }
+    }
+
+    // Field Officer: pre-fill their own editable inspection form.
+    // District/Regional/Finance Officer: fetch the same data read-only, to review
+    // what the Field Officer found before approving/rejecting.
+    if (officer?.role === 'FIELD_OFFICER' || officer?.role === 'DISTRICT_OFFICER' || officer?.role === 'REGIONAL_OFFICER') {
+      const appId = app.id || app.applicationId
+      setInspectionLoading(true)
+      try {
+        const ctx = await getInspectionContext(appId)
+        setInspectionContext(ctx)
+        if (officer?.role === 'FIELD_OFFICER') {
+          if (ctx.addressVerified != null) {
+            setChecklist({
+              address: Boolean(ctx.addressVerified),
+              business: Boolean(ctx.businessActivityConfirmed),
+              assets: Boolean(ctx.assetsInspected),
+            })
+          }
+          if (ctx.notes) setFieldNotes(ctx.notes)
+          if (ctx.evidenceMediaIds?.length) {
+            setUploadedMediaIds(ctx.evidenceMediaIds.map(id => ({ mediaId: id, url: null, fileName: id, uploading: false })))
+          }
+        }
+      } catch {
+        console.warn('Could not load inspection context')
+      } finally {
+        setInspectionLoading(false)
+      }
+    }
+  }
+
+  const closeModal = () => {
+    setSelectedApp(null)
+    setRejectMode(false)
+    setRejectReason('')
+    setInspectionContext(null)
+    setUploadedMediaIds([])
+    setProofRejectMilestone(null)
+    setProofRejectReason('')
+  }
+
+  // Media upload handler for inspection evidence
+  const handleMediaUpload = async (e) => {
+    const files = Array.from(e.target.files)
+    if (!files.length) return
+    const placeholders = files.map(f => ({ mediaId: null, url: URL.createObjectURL(f), fileName: f.name, uploading: true }))
+    setUploadedMediaIds(prev => [...prev, ...placeholders])
+    const startIdx = uploadedMediaIds.length
+    for (let i = 0; i < files.length; i++) {
+      try {
+        const result = await uploadInspectionMedia(files[i])
+        setUploadedMediaIds(prev => prev.map((item, idx) => {
+          if (idx === startIdx + i) return { ...item, mediaId: result.mediaId, uploading: false }
+          return item
+        }))
+      } catch {
+        showToast('Failed to upload evidence image. Please try again.', 'error')
+        setUploadedMediaIds(prev => prev.filter((_, idx) => idx !== startIdx + i))
+      }
+    }
+  }
+
+  // Field inspection submit handler
+  const handleInspectionSubmit = async () => {
+    if (!checklist.address || !checklist.business || !checklist.assets) {
+      setToast({ type: 'error', message: 'All checklist items must be verified to submit the report.' })
+      setTimeout(() => setToast(null), 3000)
+      return
+    }
+    const pendingUploads = uploadedMediaIds.filter(m => m.uploading)
+    if (pendingUploads.length > 0) {
+      setToast({ type: 'error', message: 'Please wait for all evidence images to finish uploading.' })
+      setTimeout(() => setToast(null), 3000)
+      return
+    }
+    const appId = selectedApp.id || selectedApp.applicationId
+    setSubmittingInspection(true)
+    try {
+      await submitInspectionReport({
+        applicationId: appId,
+        addressVerified: checklist.address,
+        businessActivityConfirmed: checklist.business,
+        assetsInspected: checklist.assets,
+        notes: fieldNotes,
+        evidenceMediaIds: uploadedMediaIds.filter(m => m.mediaId).map(m => m.mediaId),
+      })
+      // Update local table status
+      setApplications(prev =>
+        prev.map(a => (a.id || a.applicationId) === appId
+          ? { ...a, status: 'INSPECTION_COMPLETED' }
+          : a
+        )
+      )
+      setToast({ type: 'success', message: 'Inspection Report Submitted Successfully' })
+      setTimeout(() => setToast(null), 4000)
+      closeModal()
+    } catch {
+      setToast({ type: 'error', message: 'Failed to submit report. Please check your connection and try again.' })
+      setTimeout(() => setToast(null), 4000)
+    } finally {
+      setSubmittingInspection(false)
+    }
+  }
+
+  const decide = async (status) => {
+    if (!selectedApp) return
+    const appId = selectedApp.id || selectedApp.applicationId
+    try {
+      const result = await updateApprovalStatus(
+        appId,
+        status.toUpperCase(),
+        status.toUpperCase() === 'REJECTED' ? rejectReason : ''
+      )
+      if (result.status) {
+        setApplications(prev =>
+          prev.map(a => (a.id || a.applicationId) === appId ? { ...a, status } : a)
+        )
+        showToast(result.message || `Application ${appId} ${status.toLowerCase()}.`, status === 'Approved' ? 'success' : 'error')
+        closeModal()
+      } else {
+        showToast(result.message || 'Action failed.', 'error')
+      }
+    } catch (err) {
+      showToast(err.message || 'Action failed.', 'error')
+    }
+  }
+
+  const handleApprove = () => decide('Approved')
+  const handleReject = () => {
+    if (!rejectReason.trim()) { showToast('Please provide a reason for rejection.', 'error'); return }
+    decide('Rejected')
+  }
+
+  const fetchAndOpenDisbursement = async (applicationId) => {
+    try {
+      const plan = await getDisbursementPlan(applicationId)
+      setDisbursementPlan(plan)
+      
+      // If milestones are empty, initialize default configuration stages
+      if (!plan.milestones || plan.milestones.length === 0) {
+        const count = plan.totalStages || 3
+        const defaultStages = []
+        for (let i = 1; i <= count; i++) {
+          defaultStages.push({
+            stageNumber: i,
+            milestoneName: i === 1 ? 'Initial Documentation Submitted' : i === 2 ? 'Ground Verification Completed' : 'Final Utilization Proof Submitted',
+            amountToRelease: i === 1 ? 20000 : i === 2 ? 15000 : 15000,
+            dueDate: new Date(Date.now() + i * 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+          })
+        }
+        setPlanConfigStages(defaultStages)
+      }
+      setShowDisbursementManager(true)
+    } catch (err) {
+      showToast(err.message || 'Disbursement plan not found.', 'error')
+    }
+  }
+
+  const handleConfigurePlan = async () => {
+    if (!disbursementPlan) return
+    const sum = planConfigStages.reduce((acc, curr) => acc + Number(curr.amountToRelease), 0)
+    if (Math.abs(sum - disbursementPlan.totalAmount) > 0.01) {
+      showToast(`Stage amounts sum to ₹${sum.toLocaleString('en-IN')}, but must equal the total plan amount ₹${disbursementPlan.totalAmount.toLocaleString('en-IN')}.`, 'error')
+      return
+    }
+
+    try {
+      const updatedPlan = await configureDisbursementPlan(disbursementPlan.planId, planConfigStages)
+      setDisbursementPlan(updatedPlan)
+      showToast('Disbursement plan configured successfully!')
+    } catch (err) {
+      showToast(err.message || 'Configuration failed.', 'error')
+    }
+  }
+
+  const handleCompleteMilestone = async (milestoneId) => {
+    try {
+      await completeMilestone(milestoneId)
+      showToast('Milestone status marked as COMPLETED!')
+      // Refresh plan
+      const plan = await getDisbursementPlan(selectedApp.id)
+      setDisbursementPlan(plan)
+    } catch (err) {
+      showToast(err.message || 'Failed to complete milestone.', 'error')
+    }
+  }
+
+  const refreshSelectedPlan = async () => {
+    const appId = getApplicationId(selectedApp) || disbursementPlan?.applicationId
+    if (!appId) return
+    const plan = await getDisbursementPlan(appId)
+    setDisbursementPlan(plan)
+  }
+
+  const canReviewProof = isOfficerAssignedToApp(officer, selectedApp)
+
+  const handleApproveProof = async (milestoneId) => {
+    if (!canReviewProof) {
+      showToast('You can only review proof for applications assigned to you.', 'error')
+      return
+    }
+    setProofActionBusyId(milestoneId)
+    try {
+      await completeMilestone(milestoneId)
+      showToast('Proof approved. Milestone marked as COMPLETED.')
+      await refreshSelectedPlan()
+    } catch (err) {
+      showToast(err.message || 'Failed to approve proof.', 'error')
+    } finally {
+      setProofActionBusyId(null)
+    }
+  }
+
+  const handleConfirmRejectProof = async () => {
+    if (!proofRejectMilestone) return
+    if (!canReviewProof) {
+      showToast('You can only review proof for applications assigned to you.', 'error')
+      return
+    }
+    if (!proofRejectReason.trim()) {
+      showToast('Please provide a reason for requesting resubmission.', 'error')
+      return
+    }
+    const milestoneId = proofRejectMilestone.milestoneId
+    setProofActionBusyId(milestoneId)
+    try {
+      await rejectProof(milestoneId, proofRejectReason.trim())
+      showToast('Proof rejected. The beneficiary can resubmit.')
+      setProofRejectMilestone(null)
+      setProofRejectReason('')
+      await refreshSelectedPlan()
+    } catch (err) {
+      showToast(err.message || 'Failed to reject proof.', 'error')
+    } finally {
+      setProofActionBusyId(null)
+    }
+  }
+
+  const renderProofReviewSection = () => {
+    const pendingProofs = getProofPendingMilestones(disbursementPlan)
+    if (!pendingProofs.length) return null
+
+    return (
+      <div className="proof-review-section">
+        <h4 className="proof-review-section__title">Stage Proof Awaiting Review</h4>
+        {pendingProofs.map((m) => {
+          const busy = proofActionBusyId === m.milestoneId
+          return (
+            <div className="proof-review-card" key={m.milestoneId}>
+              <div className="proof-review-card__header">
+                <strong>Stage {m.stageNumber}: {m.milestoneName}</strong>
+                <span className="badge-status status-proof_submitted">PROOF SUBMITTED</span>
+              </div>
+              <div className="proof-review-card__meta">
+                {m.fileName && <div><strong>Document:</strong> {m.fileName}</div>}
+                {m.proofDocumentUrl ? (
+                  <a
+                    href={m.proofDocumentUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="proof-review-card__link"
+                  >
+                    View uploaded proof
+                  </a>
+                ) : (
+                  <div className="proof-review-card__muted">Proof document URL is not available.</div>
+                )}
+                {m.proofNotes ? (
+                  <div className="proof-review-card__notes">
+                    <strong>Beneficiary notes:</strong>
+                    <p>{m.proofNotes}</p>
+                  </div>
+                ) : null}
+              </div>
+              {canReviewProof ? (
+                <div className="proof-review-card__actions">
+                  <button
+                    className="button button--primary"
+                    style={{ padding: '0.4rem 0.9rem', fontSize: '0.82rem' }}
+                    onClick={() => handleApproveProof(m.milestoneId)}
+                    disabled={busy}
+                  >
+                    {busy ? 'Working…' : 'Approve Proof'}
+                  </button>
+                  <button
+                    className="button button--ghost"
+                    style={{ padding: '0.4rem 0.9rem', fontSize: '0.82rem', color: '#ef4444', borderColor: '#fca5a5' }}
+                    onClick={() => {
+                      setProofRejectMilestone(m)
+                      setProofRejectReason('')
+                    }}
+                    disabled={busy}
+                  >
+                    Reject / Request Resubmission
+                  </button>
+                </div>
+              ) : (
+                <p className="proof-review-card__muted">Read-only: this application is not assigned to you for proof review.</p>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  const handleReleaseMilestone = async (milestoneId) => {
+    try {
+      await releaseMilestone(milestoneId)
+      showToast('Funds released successfully!', 'success')
+      // Refresh plan
+      const plan = await getDisbursementPlan(selectedApp.id)
+      setDisbursementPlan(plan)
+      // Reload applications to sync potential state or stats
+      const data = await getMyApplications()
+      setApplications(Array.isArray(data) ? data : data?.data || [])
+    } catch (err) {
+      showToast(err.message || 'Release failed.', 'error')
+    }
+  }
+
+  // Task 2 Handlers
+  const fetchOverdueReports = async () => {
+    try {
+      const data = await getOverdueMilestones()
+      setOverdueReports(data || [])
+    } catch (err) {
+      console.error('Failed to load overdue report:', err.message)
+    }
+  }
+
+  const fetchNotifications = async () => {
+    try {
+      const data = await getNotifications()
+      setNotifications(data || [])
+    } catch (err) {
+      console.error('Failed to load notifications:', err.message)
+    }
+  }
+
+  const handleResolveMilestone = async () => {
+    if (!resolvedReasonInput.trim()) {
+      showToast('Resolution reason is mandatory', 'error')
+      return
+    }
+    setIsResolving(true)
+    try {
+      await resolveMilestone(resolvingMilestoneId, resolvedReasonInput)
+      showToast('Overdue milestone resolved successfully!')
+      setShowResolveModal(false)
+      setResolvedReasonInput('')
+      
+      // Refresh current plan if open
+      if (selectedApp) {
+        const plan = await getDisbursementPlan(selectedApp.id)
+        setDisbursementPlan(plan)
+      }
+      // Refresh overdue report list
+      await fetchOverdueReports()
+    } catch (err) {
+      showToast(err.message || 'Failed to resolve milestone.', 'error')
+    } finally {
+      setIsResolving(false)
+    }
+  }
+
+  // Load compliance records on active tab change
+  useEffect(() => {
+    if (activeTab === 'reports') {
+      fetchOverdueReports()
+    }
+    if (activeTab === 'notifications') {
+      fetchNotifications()
+    }
+    // Fetch notifications initially to get badge count
+    if (activeTab === 'home') {
+      fetchNotifications()
+    }
+  }, [activeTab])
+
+  // Initial notification load on mount
+  useEffect(() => {
+    fetchNotifications()
+  }, [])
+
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--muted)' }}>
+        Loading...
+      </div>
+    )
+  }
+
+  if (!officer) return null
+
+  return (
+    <div className="dashboard-layout">
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            className={`toast toast--${toast.type}`}
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+          >
+            {toast.message}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Header Sticky Topbar */}
+      <DashboardTopbar
+        brandTitle="GS Officer Portal"
+        brandSubtitle="National Subsidy Tracking & Oversight"
+        userName={officer.fullName}
+        userRole={officer.designation || 'Officer'}
+        onLogout={handleLogout}
+        showHomeLink={false}
+      />
+
+      {/* Main Panel Content */}
+      <main className="dashboard-main">
+        <div className="dashboard-tabs">
+          <button
+            className={`dashboard-tab ${activeTab === 'home' ? 'active' : ''}`}
+            onClick={() => setActiveTab('home')}
+          >
+            <FaHome /> Dashboard Home
+          </button>
+          <button
+            className={`dashboard-tab ${activeTab === 'applications' ? 'active' : ''}`}
+            onClick={() => setActiveTab('applications')}
+          >
+            <FaClipboardList /> Application Management
+            {pending > 0 && <span className="tab-badge">{pending}</span>}
+          </button>
+          <button
+            className={`dashboard-tab ${activeTab === 'reports' ? 'active' : ''}`}
+            onClick={() => setActiveTab('reports')}
+          >
+            <FaChartLine /> Reports &amp; Analytics
+          </button>
+          <button
+            className={`dashboard-tab ${activeTab === 'notifications' ? 'active' : ''}`}
+            onClick={() => setActiveTab('notifications')}
+          >
+            <FaBell /> Alerts &amp; Reminders
+            {notifications.length > 0 && <span className="tab-badge" style={{ background: '#a855f7' }}>{notifications.length}</span>}
+          </button>
+          <button
+            className={`dashboard-tab ${activeTab === 'profile' ? 'active' : ''}`}
+            onClick={() => setActiveTab('profile')}
+          >
+            <FaUserCircle /> Profile
+          </button>
+        </div>
+
+        <div className="tab-pane">
+          {/* TAB 1: DASHBOARD HOME */}
+          {activeTab === 'home' && (
+            <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+              <div className="pane-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+                <div>
+                  <h2>Officer Dashboard</h2>
+                  <p>Monitor subsidy applications, verify documents, and approve or reject requests.</p>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1.25rem', marginBottom: '2rem' }}>
+                {/* Total Applications */}
+                <div className="stat-card stat-card--total">
+                  <div className="stat-card__header">
+                    <span>Total Applications</span>
+                    <FaClipboardList style={{ fontSize: '1.1rem', opacity: 0.7 }} />
+                  </div>
+                  <div className="stat-card__value">{total}</div>
+                  <span className="stat-card__desc" style={{ color: '#82aeca' }}>Overall assigned workload</span>
+                </div>
+
+                {/* Pending Applications */}
+                <div className="stat-card stat-card--pending">
+                  <div className="stat-card__header">
+                    <span>Pending Action</span>
+                    <FaHourglassHalf style={{ fontSize: '1.1rem', opacity: 0.7 }} />
+                  </div>
+                  <div className="stat-card__value" style={{ color: '#f59e0b' }}>{pending}</div>
+                  <span className="stat-card__desc">Awaiting your verification</span>
+                </div>
+
+                {/* Approved Applications */}
+                <div className="stat-card stat-card--approved">
+                  <div className="stat-card__header">
+                    <span>Approved & Eligible</span>
+                    <FaCheckCircle style={{ fontSize: '1.1rem', opacity: 0.7, color: '#22c55e' }} />
+                  </div>
+                  <div className="stat-card__value" style={{ color: '#22c55e' }}>{approved}</div>
+                  <span className="stat-card__desc" style={{ color: '#8ed66a' }}>{approvalRate}% Approval rate</span>
+                </div>
+
+                {/* Rejected Applications */}
+                <div className="stat-card stat-card--rejected">
+                  <div className="stat-card__header">
+                    <span>Rejected Applications</span>
+                    <FaTimesCircle style={{ fontSize: '1.1rem', opacity: 0.7, color: '#ef4444' }} />
+                  </div>
+                  <div className="stat-card__value" style={{ color: '#ef4444' }}>{rejected}</div>
+                  <span className="stat-card__desc">Ineligible or issues found</span>
+                </div>
+              </div>
+
+              <h3 className="section-title" style={{ marginTop: '2.5rem' }}>Recent Applications</h3>
+              {applications.length === 0 ? (
+                <div className="empty-state"><p>No applications assigned yet.</p></div>
+              ) : (
+                <div className="dbt-ledger-wrap">
+                  <table className="dbt-ledger">
+                    <thead>
+                      <tr>
+                        <th>Application ID</th>
+                        <th>Applicant</th>
+                        <th>Scheme</th>
+                        <th>Submitted</th>
+                        <th>Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {applications.slice(0, 5).map(app => (
+                        <tr key={app.id || app.applicationId}>
+                          <td className="font-mono text-soft">{app.id || app.applicationId}</td>
+                          <td>{app.applicant || app.applicantName}</td>
+                          <td>{app.schemeName || app.schemeId || '—'}</td>
+                          <td className="font-mono">{app.submittedDate || app.createdAt || '—'}</td>
+                          <td>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                              <span className={`badge-status ${STATUS_BADGE[app.status] || ''}`}>{app.status}</span>
+                              {app.currentStage && (
+                                <span style={{ fontSize: '0.72rem', color: 'var(--muted)', textTransform: 'capitalize' }}>
+                                  Stage: {String(app.currentStage).split('_').join(' ').toLowerCase()}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div style={{ marginTop: '1.5rem' }}>
+                <button className="button button--primary" onClick={() => setActiveTab('applications')}>
+                  Manage Applications
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {/* TAB 2: APPLICATION MANAGEMENT */}
+          {activeTab === 'applications' && (
+            <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+              <div className="pane-header">
+                <h2>Application Management</h2>
+                <p>Review submitted applications and approve or reject subsidy requests.</p>
+              </div>
+
+              <div className="filter-bar">
+                <div className="search-box">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="11" cy="11" r="8" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
+                  <input
+                    type="text"
+                    placeholder="Search by applicant or application ID..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                  />
+                </div>
+                <div className="category-chips">
+                  {['All', 'Pending', 'Approved', 'Rejected'].map(status => (
+                    <button
+                      key={status}
+                      className={`cat-chip ${statusFilter === status ? 'active' : ''}`}
+                      onClick={() => setStatusFilter(status)}
+                    >
+                      {status}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {filteredApps.length > 0 ? (
+                <div className="dbt-ledger-wrap">
+                  <table className="dbt-ledger">
+                    <thead>
+                      <tr>
+                        <th>Application ID</th>
+                        <th>Applicant</th>
+                        <th>Scheme</th>
+                        <th>Submitted</th>
+                        <th>Status</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredApps.map(app => (
+                        <tr key={app.id || app.applicationId}>
+                          <td className="font-mono text-soft">{app.id || app.applicationId}</td>
+                          <td>{app.applicant || app.applicantName}</td>
+                          <td>{app.schemeName || app.schemeId || '—'}</td>
+                          <td className="font-mono">{app.submittedDate || app.createdAt || '—'}</td>
+                          <td>
+                            <span className={`badge-status ${STATUS_BADGE[app.status] || ''}`}>{app.status}</span>
+                          </td>
+                          <td>
+                            <button className="officer-view-btn" onClick={() => openApplication(app)}>
+                              View
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="empty-state">
+                  <h3>No applications match your criteria</h3>
+                  <p>Try adjusting your search terms or filters.</p>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {/* TAB 3: REPORTS & ANALYTICS */}
+          {activeTab === 'reports' && (
+            <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+              
+              <div className="reports-analytics-shell">
+                <SchemeDashboard />
+              </div>
+
+              <h3 className="section-title" style={{ marginTop: '2.5rem', color: '#ef4444' }}>⚠️ Non-Compliance &amp; Overdue Milestones</h3>
+              {overdueReports.length === 0 ? (
+                <div className="empty-state" style={{ border: '1px dashed var(--border)', padding: '2rem' }}>
+                  <p>All milestones are compliant. No overdue stages found.</p>
+                </div>
+              ) : (
+                <div className="dbt-ledger-wrap" style={{ marginTop: '1rem' }}>
+                  <table className="dbt-ledger">
+                    <thead>
+                      <tr>
+                        <th>Milestone ID</th>
+                        <th>Beneficiary Name</th>
+                        <th>Scheme</th>
+                        <th>Milestone Name</th>
+                        <th>Due Date</th>
+                        <th>Days Overdue</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overdueReports.map(rep => (
+                        <tr key={rep.milestoneId}>
+                          <td className="font-mono text-soft">#{rep.milestoneId}</td>
+                          <td style={{ fontWeight: 600 }}>{rep.beneficiaryName}</td>
+                          <td>{rep.schemeName}</td>
+                          <td>{rep.milestoneName}</td>
+                          <td className="font-mono" style={{ color: '#ef4444' }}>{rep.dueDate}</td>
+                          <td style={{ color: '#ef4444', fontWeight: 'bold' }}>
+                            {rep.daysOverdue} days
+                          </td>
+                          <td>
+                            <button 
+                              className="button button--secondary" 
+                              style={{ padding: '0.35rem 0.8rem', fontSize: '0.8rem', borderColor: '#ef4444', color: '#ef4444' }}
+                              onClick={() => {
+                                setResolvingMilestoneId(rep.milestoneId)
+                                setShowResolveModal(true)
+                              }}
+                            >
+                              Resolve Override
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {/* TAB 4: ALERTS & REMINDERS */}
+          {activeTab === 'notifications' && (
+            <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+              <div className="pane-header">
+                <h2>Alerts &amp; Reminders Log</h2>
+                <p>Notifications dispatched to beneficiaries reminding them of upcoming due dates.</p>
+              </div>
+
+              {notifications.length === 0 ? (
+                <div className="empty-state" style={{ padding: '3rem' }}>
+                  <p>No notifications have been dispatched yet.</p>
+                </div>
+              ) : (
+                <div className="notifications-list" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '1.5rem' }}>
+                  {notifications.map(notif => (
+                    <div 
+                      key={notif.id} 
+                      className="notification-item" 
+                      style={{ 
+                        background: 'var(--card-bg)', 
+                        border: '1px solid var(--border)', 
+                        borderRadius: '8px', 
+                        padding: '1.2rem',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.5rem'
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontWeight: 600, color: 'var(--text)' }}>
+                          Recipient: {notif.user?.fullName} (@{notif.user?.username})
+                        </span>
+                        <span className="font-mono" style={{ fontSize: '0.8rem', color: 'var(--muted)' }}>
+                          Sent: {notif.sentDate}
+                        </span>
+                      </div>
+                      <p style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text)' }}>
+                        {notif.message}
+                      </p>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--muted)' }}>
+                        Milestone Reference: #{notif.milestoneId}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {/* TAB 5: PROFILE CHECK */}
+          {activeTab === 'profile' && (
+            <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+              <ProfilePanel
+                profile={officer}
+                role={officer?.role || officer?.designation || 'FIELD_OFFICER'}
+                editable={false}
+                deletable={false}
+                subtitle="Review the officer account details that are already stored in the backend."
+              />
+            </motion.div>
+          )}
+        </div>
+      </main>
+
+      {/* Application Details Modal */}
+      <AnimatePresence>
+        {selectedApp && (
+          <div className="modal-overlay" onClick={closeModal}>
+            <motion.div
+              className="modal-panel"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              onClick={(e) => e.stopPropagation()}
+              style={{ maxWidth: '1000px', width: '90%', textAlign: 'left' }}
+            >
+              {officer?.role === 'FIELD_OFFICER' ? (
+                // FIELD INSPECTOR DETAILED SCREEN (Image 3 & 4)
+                <>
+                  <div className="applicant-review-header" style={{ marginBottom: '1.5rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.8rem' }}>
+                    <div className="applicant-review-header__title">
+                      <h2 style={{ margin: 0, fontSize: '1.6rem', fontFamily: 'Source Serif 4, Georgia, serif' }}>Field Inspection Report</h2>
+                      <p style={{ margin: '0.2rem 0 0 0', fontSize: '0.85rem', color: 'var(--muted)' }}>Complete the verification findings for the assigned application.</p>
+                    </div>
+                    <div className="applicant-review-header__actions" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span className="custom-badge-pending" style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}>
+                        <span className="custom-badge-pending__dot"></span>
+                        Inspection Stage
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Two Column Layout */}
+                  <div className="review-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1.2rem', marginBottom: '1.5rem' }}>
+                    {/* Left Card: Beneficiary Context */}
+                    <div className="review-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px' }}>
+                      <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
+                          <circle cx="12" cy="7" r="4" />
+                        </svg>
+                        Beneficiary Context
+                      </h4>
+                      <div className="detail-form-grid" style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
+                        <div className="detail-field">
+                          <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Beneficiary Name</label>
+                          <input className="detail-field__input" type="text" readOnly value={selectedApp.applicant || selectedApp.applicantName} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                        </div>
+                        <div className="detail-field">
+                          <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Application ID</label>
+                          <input className="detail-field__input" type="text" readOnly value={selectedApp.id || selectedApp.applicationId} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                        </div>
+                        <div className="detail-field">
+                          <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Scheme Category</label>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.2rem' }}>
+                            <span className="custom-badge-verified" style={{ background: '#dcfce7', color: '#15803d', padding: '0.25rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 700 }}>
+                              ● {selectedApp.schemeName || selectedApp.schemeId || 'Agricultural Innovation Grant'}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="detail-field">
+                          <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Inspection Location</label>
+                          <input className="detail-field__input" type="text" readOnly value={`${selectedApp.district || 'Lucknow District'}, ${selectedApp.state || 'Uttar Pradesh'}`} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right Card: Verification Checklist */}
+                    <div className="review-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px' }}>
+                      <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z" />
+                          <path d="m9 12 2 2 4-4" />
+                        </svg>
+                        Verification Checklist
+                      </h4>
+                      <div className="checklist-tiles" style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                        <div 
+                          className={`checklist-tile ${checklist.address ? 'checklist-tile--checked' : ''}`}
+                          onClick={() => setChecklist(prev => ({ ...prev, address: !prev.address }))}
+                          style={{ border: '1px solid var(--border)', padding: '0.65rem 0.85rem', borderRadius: '6px', display: 'flex', gap: '0.75rem', cursor: 'pointer', background: checklist.address ? 'rgba(22, 163, 74, 0.03)' : 'transparent', transition: 'all 150ms ease' }}
+                        >
+                          <input type="checkbox" checked={checklist.address} readOnly style={{ accentColor: 'var(--accent)' }} />
+                          <div className="checklist-tile__info">
+                            <strong style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text)' }}>Address Verified</strong>
+                            <span style={{ display: 'block', fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.1rem' }}>Physical location matches application address.</span>
+                          </div>
+                        </div>
+
+                        <div 
+                          className={`checklist-tile ${checklist.business ? 'checklist-tile--checked' : ''}`}
+                          onClick={() => setChecklist(prev => ({ ...prev, business: !prev.business }))}
+                          style={{ border: '1px solid var(--border)', padding: '0.65rem 0.85rem', borderRadius: '6px', display: 'flex', gap: '0.75rem', cursor: 'pointer', background: checklist.business ? 'rgba(22, 163, 74, 0.03)' : 'transparent', transition: 'all 150ms ease' }}
+                        >
+                          <input type="checkbox" checked={checklist.business} readOnly style={{ accentColor: 'var(--accent)' }} />
+                          <div className="checklist-tile__info">
+                            <strong style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text)' }}>Business Activity Confirmed</strong>
+                            <span style={{ display: 'block', fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.1rem' }}>Operations align with proposed subsidy goals.</span>
+                          </div>
+                        </div>
+
+                        <div 
+                          className={`checklist-tile ${checklist.assets ? 'checklist-tile--checked' : ''}`}
+                          onClick={() => setChecklist(prev => ({ ...prev, assets: !prev.assets }))}
+                          style={{ border: '1px solid var(--border)', padding: '0.65rem 0.85rem', borderRadius: '6px', display: 'flex', gap: '0.75rem', cursor: 'pointer', background: checklist.assets ? 'rgba(22, 163, 74, 0.03)' : 'transparent', transition: 'all 150ms ease' }}
+                        >
+                          <input type="checkbox" checked={checklist.assets} readOnly style={{ accentColor: 'var(--accent)' }} />
+                          <div className="checklist-tile__info">
+                            <strong style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text)' }}>Assets Inspected</strong>
+                            <span style={{ display: 'block', fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.1rem' }}>Farming equipment/facilities verified and functional.</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Site Evidence — dynamic upload */}
+                  <div className="review-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px', marginBottom: '1.2rem' }}>
+                    <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                        <circle cx="12" cy="13" r="4" />
+                      </svg>
+                      Site Evidence
+                    </h4>
+                    <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                      {uploadedMediaIds.map((media, idx) => (
+                        <div key={idx} style={{ position: 'relative', width: '120px', height: '90px', border: '1px solid var(--border)', borderRadius: '6px', overflow: 'hidden', background: '#f3f4f6' }}>
+                          {media.url
+                            ? <img src={media.url} alt={media.fileName} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f3f4f6', fontSize: '0.65rem', color: 'var(--muted)', textAlign: 'center', padding: '4px' }}>{media.fileName}</div>
+                          }
+                          {media.uploading && (
+                            <div style={{ position: 'absolute', inset: 0, background: 'rgba(255,255,255,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" style={{ animation: 'spin 1s linear infinite' }}>
+                                <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                                <path d="M12 2a10 10 0 0 1 10 10" />
+                              </svg>
+                            </div>
+                          )}
+                          <button
+                            onClick={() => setUploadedMediaIds(prev => prev.filter((_, i) => i !== idx))}
+                            style={{ position: 'absolute', top: '2px', right: '2px', background: 'rgba(0,0,0,0.55)', border: 'none', borderRadius: '50%', width: '18px', height: '18px', color: '#fff', cursor: 'pointer', fontSize: '10px', lineHeight: '18px', textAlign: 'center' }}
+                          >✕</button>
+                        </div>
+                      ))}
+                      <label htmlFor="evidence-upload" style={{ width: '120px', height: '90px', border: '2px dashed var(--border)', borderRadius: '6px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)', cursor: 'pointer', flexShrink: 0 }}>
+                        <span style={{ fontSize: '1.4rem', lineHeight: 1 }}>+</span>
+                        <span style={{ fontSize: '0.65rem', fontWeight: 600, marginTop: '2px' }}>Add Photo</span>
+                        <input
+                          id="evidence-upload"
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          style={{ display: 'none' }}
+                          onChange={handleMediaUpload}
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Field Observations Notes */}
+                  <div className="detail-field" style={{ marginBottom: '1.8rem' }}>
+                    <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase', display: 'block', marginBottom: '0.4rem' }}>Field Observations & Inspector Notes</label>
+                    <textarea 
+                      placeholder="Add compliance notes or report comments here..."
+                      value={fieldNotes}
+                      onChange={(e) => setFieldNotes(e.target.value)}
+                      style={{ width: '100%', minHeight: '80px', padding: '0.75rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.88rem', outline: 'none', color: 'var(--text)' }}
+                    />
+                  </div>
+
+                  {renderProofReviewSection()}
+
+                  {/* Action buttons */}
+                  <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end', borderTop: '1px solid var(--border)', paddingTop: '1rem' }}>
+                    <button className="button button--ghost" onClick={closeModal} disabled={submittingInspection} style={{ padding: '0.55rem 1.25rem' }}>Cancel</button>
+                    <button 
+                      className="button button--primary" 
+                      onClick={handleInspectionSubmit}
+                      disabled={submittingInspection || uploadedMediaIds.some(m => m.uploading)}
+                      style={{ padding: '0.55rem 1.25rem', background: 'var(--accent)', color: '#fff', opacity: submittingInspection ? 0.7 : 1, display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+                    >
+                      {submittingInspection && (
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }}>
+                          <circle cx="12" cy="12" r="10" strokeOpacity="0.3" />
+                          <path d="M12 2a10 10 0 0 1 10 10" />
+                        </svg>
+                      )}
+                      {submittingInspection ? 'Submitting…' : 'Submit Inspection Report'}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                // GENERIC OFFICER REVIEW STAGE — used by District, Regional and Finance Officers (Image 2)
+                <>
+                  <div className="applicant-review-header" style={{ marginBottom: '1.5rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.8rem' }}>
+                    <div className="applicant-review-header__title">
+                      <h2 style={{ margin: 0, fontSize: '1.6rem', fontFamily: 'Source Serif 4, Georgia, serif' }}>{selectedApp.applicant || selectedApp.applicantName}</h2>
+                      <p style={{ margin: '0.2rem 0 0 0', fontSize: '0.85rem', color: 'var(--muted)' }}>ID: {selectedApp.id || selectedApp.applicationId} · Application Review Stage</p>
+                    </div>
+                    <div className="applicant-review-header__actions" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span className="custom-badge-pending" style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem' }}>
+                        <span className="custom-badge-pending__dot"></span>
+                        Verification Pending
+                      </span>
+                    </div>
+                  </div>
+
+                  {rejectMode && (
+                    <div className="delete-confirm-box" style={{ background: '#fef2f2', border: '1px solid #fca5a5', padding: '0.85rem', borderRadius: '6px', marginBottom: '1rem' }}>
+                      <label style={{ color: '#991b1b', fontWeight: 'bold', display: 'block', fontSize: '0.8rem', marginBottom: '0.3rem' }}>Rejection Reason/Description</label>
+                      <textarea
+                        placeholder="Enter detailed reason for rejecting this application..."
+                        value={rejectReason}
+                        onChange={(e) => setRejectReason(e.target.value)}
+                        style={{ width: '100%', minHeight: '60px', padding: '0.5rem', background: '#fff', border: '1px solid #fca5a5', borderRadius: '4px', fontSize: '0.85rem', outline: 'none' }}
+                      />
+                      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem', justifyContent: 'flex-end' }}>
+                        <button className="button button--ghost" onClick={() => setRejectMode(false)} style={{ fontSize: '0.75rem', padding: '0.35rem 0.75rem' }}>Cancel</button>
+                        <button className="button btn-danger-confirm" onClick={handleReject} style={{ fontSize: '0.75rem', padding: '0.35rem 0.75rem', background: '#ef4444', color: '#fff', border: 'none', borderRadius: '4px' }}>Confirm Rejection</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* User Details (Top) */}
+                  <div className="user-details-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px', marginBottom: '1.2rem' }}>
+                    <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
+                        <circle cx="12" cy="7" r="4" />
+                      </svg>
+                      Applicant Details
+                    </h4>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem' }}>
+                      <div className="detail-field">
+                        <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Full Name</label>
+                        <input className="detail-field__input" type="text" readOnly value={selectedApp.applicant || selectedApp.applicantName || 'Not Available'} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                      </div>
+                      <div className="detail-field">
+                        <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Scheme Name</label>
+                        <input className="detail-field__input" type="text" readOnly value={selectedApp.schemeName || selectedApp.schemeId || 'Not Available'} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                      </div>
+                      <div className="detail-field">
+                        <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Phone Number</label>
+                        <input className="detail-field__input" type="text" readOnly value={selectedApp.phone || 'Not Available'} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                      </div>
+                      <div className="detail-field">
+                        <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Location</label>
+                        <input className="detail-field__input" type="text" readOnly value={`${selectedApp.district || 'Not Available'}, ${selectedApp.state || 'Not Available'}`} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Two Column Grid */}
+                  <div className="review-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1.2rem', marginBottom: '1.5rem' }}>
+                    {/* Left Card: Field Details */}
+                    <div className="review-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px' }}>
+                      <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                          <polyline points="14 2 14 8 20 8" />
+                          <line x1="16" y1="13" x2="8" y2="13" />
+                          <line x1="16" y1="17" x2="8" y2="17" />
+                          <polyline points="10 9 9 9 8 9" />
+                        </svg>
+                        Field Details
+                      </h4>
+                      <div className="detail-form-grid" style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
+                        {selectedApp.fields && Object.entries(selectedApp.fields).map(([key, value]) => (
+                          <div className="detail-field" key={key}>
+                            <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>{key.replace(/_/g, ' ')}</label>
+                            <input className="detail-field__input" type="text" readOnly value={value} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                          </div>
+                        ))}
+                        {/* Fallbacks if fields are not present */}
+                        {(!selectedApp.fields || Object.keys(selectedApp.fields).length === 0) && (
+                          <>
+                            <div className="detail-field">
+                              <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Date of Birth</label>
+                              <input className="detail-field__input" type="text" readOnly value={selectedApp.dob || '14 May 1985'} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                            </div>
+                            <div className="detail-field">
+                              <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Gender</label>
+                              <input className="detail-field__input" type="text" readOnly value={'Male'} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                            </div>
+                            <div className="detail-field">
+                              <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase' }}>Annual Income</label>
+                              <input className="detail-field__input" type="text" readOnly value={`₹ ${Number(selectedApp.annualIncome || selectedApp.amount || 120000).toLocaleString('en-IN')}`} style={{ width: '100%', padding: '0.5rem', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', fontSize: '0.85rem' }} />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Right Card: Documents Preview Pane */}
+                    <div className="review-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px' }}>
+                      <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+                          <polyline points="14 2 14 8 20 8" />
+                        </svg>
+                        Documents
+                      </h4>
+
+                      {/* Doc tabs */}
+                      <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.8rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.4rem', overflowX: 'auto' }}>
+                        {selectedApp.documents && selectedApp.documents.length > 0 ? (
+                          selectedApp.documents.map((doc, idx) => (
+                            <button
+                              key={idx}
+                              className={`document-tab-btn ${activeDocTab === doc.type ? 'active' : ''}`}
+                              onClick={() => setActiveDocTab(doc.type)}
+                              style={{ border: 'none', background: 'transparent', padding: '0.4rem 0.75rem', fontSize: '0.8rem', fontWeight: 600, color: activeDocTab === doc.type ? 'var(--accent)' : 'var(--muted)', cursor: 'pointer', borderBottom: activeDocTab === doc.type ? '2px solid var(--accent)' : 'none', whiteSpace: 'nowrap' }}
+                            >
+                              {doc.type.replace(/_/g, ' ')}
+                            </button>
+                          ))
+                        ) : (
+                          <>
+                            <button 
+                              className={`document-tab-btn ${activeDocTab === 'aadhaar' ? 'active' : ''}`}
+                              onClick={() => setActiveDocTab('aadhaar')}
+                              style={{ border: 'none', background: 'transparent', padding: '0.4rem 0.75rem', fontSize: '0.8rem', fontWeight: 600, color: activeDocTab === 'aadhaar' ? 'var(--accent)' : 'var(--muted)', cursor: 'pointer', borderBottom: activeDocTab === 'aadhaar' ? '2px solid var(--accent)' : 'none' }}
+                            >
+                              Aadhaar
+                            </button>
+                            <button 
+                              className={`document-tab-btn ${activeDocTab === 'income' ? 'active' : ''}`}
+                              onClick={() => setActiveDocTab('income')}
+                              style={{ border: 'none', background: 'transparent', padding: '0.4rem 0.75rem', fontSize: '0.8rem', fontWeight: 600, color: activeDocTab === 'income' ? 'var(--accent)' : 'var(--muted)', cursor: 'pointer', borderBottom: activeDocTab === 'income' ? '2px solid var(--accent)' : 'none' }}
+                            >
+                              Income Cert
+                            </button>
+                          </>
+                        )}
+                      </div>
+
+                      {/* Doc preview block */}
+                      <div className="doc-preview-pane" style={{ border: '1px solid var(--border)', borderRadius: '6px', overflow: 'hidden', background: '#fafaf9', flex: 1, display: 'flex', flexDirection: 'column' }}>
+                        <div className="doc-preview-pane__header" style={{ padding: '0.45rem 0.75rem', background: '#f5f4f0', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.76rem', color: 'var(--text-soft)' }}>
+                          <span>
+                            {selectedApp.documents && selectedApp.documents.length > 0 
+                              ? selectedApp.documents.find(d => d.type === activeDocTab)?.url.split('/').pop() || 'Document'
+                              : activeDocTab === 'aadhaar' ? 'Aadhaar_Card_Scan.jpg' : 'Income_Certificate.pdf'
+                            }
+                          </span>
+                        </div>
+                        <div className="doc-preview-pane__body" style={{ minHeight: '300px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                          {selectedApp.documents && selectedApp.documents.find(d => d.type === activeDocTab) ? (
+                            <img src={selectedApp.documents.find(d => d.type === activeDocTab).url} alt="Document Preview" style={{ width: '100%', height: 'auto', maxHeight: '350px', objectFit: 'contain' }} />
+                          ) : activeDocTab === 'aadhaar' ? (
+                            <img src="/aadhaar_mock.jpg" alt="Aadhaar Card Preview" style={{ width: '100%', height: 'auto', maxHeight: '350px', objectFit: 'contain' }} />
+                          ) : (
+                            <div style={{ textAlign: 'center', color: 'var(--muted)', fontSize: '0.8rem', padding: '1rem' }}>
+                              <span>Document preview is not available in mock viewer</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Field Inspection Report — submitted by the Field Officer, for District/Regional/Finance Officer review */}
+                  <div className="review-card" style={{ background: '#fff', border: '1px solid var(--border)', padding: '1rem', borderRadius: '8px', marginBottom: '1.5rem' }}>
+                    <h4 style={{ margin: '0 0 0.8rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-soft)' }}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M9 11l3 3L22 4" />
+                        <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                      </svg>
+                      Field Inspection Report
+                    </h4>
+
+                    {inspectionContext && inspectionContext.lastSubmittedAt ? (
+                      <>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.8rem', marginBottom: '0.8rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                            <span style={{ color: inspectionContext.addressVerified ? '#22c55e' : '#ef4444' }}>
+                              {inspectionContext.addressVerified ? '✓' : '✕'}
+                            </span>
+                            Address Verified
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                            <span style={{ color: inspectionContext.businessActivityConfirmed ? '#22c55e' : '#ef4444' }}>
+                              {inspectionContext.businessActivityConfirmed ? '✓' : '✕'}
+                            </span>
+                            Business Activity Confirmed
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                            <span style={{ color: inspectionContext.assetsInspected ? '#22c55e' : '#ef4444' }}>
+                              {inspectionContext.assetsInspected ? '✓' : '✕'}
+                            </span>
+                            Assets Inspected
+                          </div>
+                        </div>
+
+                        {inspectionContext.notes && (
+                          <div style={{ marginBottom: '0.8rem' }}>
+                            <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase', display: 'block', marginBottom: '0.3rem' }}>
+                              Inspector Notes
+                            </label>
+                            <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text)', background: '#fafaf9', border: '1px solid var(--border)', borderRadius: '6px', padding: '0.6rem' }}>
+                              {inspectionContext.notes}
+                            </p>
+                          </div>
+                        )}
+
+                        {inspectionContext.evidenceMediaIds?.length > 0 && (
+                          <div>
+                            <label style={{ fontSize: '0.72rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase', display: 'block', marginBottom: '0.3rem' }}>
+                              Evidence ({inspectionContext.evidenceMediaIds.length})
+                            </label>
+                            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                              {inspectionContext.evidenceMediaIds.map((id, idx) => (
+                                <span key={idx} style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem', background: '#f5f4f0', border: '1px solid var(--border)', borderRadius: '4px', color: 'var(--muted)' }}>
+                                  {id}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <p style={{ margin: '0.8rem 0 0 0', fontSize: '0.75rem', color: 'var(--muted)' }}>
+                          Submitted {new Date(inspectionContext.lastSubmittedAt).toLocaleString()}
+                        </p>
+                      </>
+                    ) : (
+                      <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--muted)' }}>
+                        No field inspection report has been submitted for this application yet.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Actions buttons */}
+                  <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem', justifyContent: 'flex-end', borderTop: '1px solid var(--border)', paddingTop: '1rem', alignItems: 'center' }}>
+                    <button className="button button--ghost" onClick={closeModal} style={{ padding: '0.55rem 1.25rem' }}>Close</button>
+                    {(selectedApp.status === 'Approved' || selectedApp.status === 'APPROVED') && (
+                      <button 
+                        className="button button--primary" 
+                        onClick={() => {
+                          closeModal();
+                          fetchAndOpenDisbursement(selectedApp.id);
+                        }}
+                        style={{ padding: '0.55rem 1.25rem', background: 'var(--accent)', color: '#fff' }}
+                      >
+                        Manage Disbursement
+                      </button>
+                    )}
+                    {selectedApp.status !== 'Rejected' && selectedApp.status !== 'REJECTED' && (
+                      rejectMode ? (
+                        <button className="btn-danger-confirm" onClick={handleReject} style={{ padding: '0.55rem 1.25rem', background: '#ef4444', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
+                          Confirm Reject
+                        </button>
+                      ) : (
+                        <button className="button button--ghost" onClick={() => setRejectMode(true)} style={{ padding: '0.55rem 1.25rem', color: '#ef4444', borderColor: '#fca5a5' }}>
+                          ✕ Reject
+                        </button>
+                      )
+                    )}
+                    {selectedApp.status !== 'Approved' && selectedApp.status !== 'APPROVED' && !rejectMode && (
+                      <button className="button button--primary" onClick={handleApprove} style={{ padding: '0.55rem 1.25rem', background: 'var(--accent)', color: '#fff' }}>
+                        ✓ Approve Application
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Disbursement Plan Modal */}
+      <AnimatePresence>
+        {showDisbursementManager && disbursementPlan && (
+          <div className="modal-overlay" onClick={() => setShowDisbursementManager(false)}>
+            <motion.div
+              className="modal-panel"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              onClick={(e) => e.stopPropagation()}
+              style={{ maxWidth: '650px', textAlign: 'left', overflowY: 'auto', maxHeight: '90vh' }}
+            >
+              <div className="tracking-card__header" style={{ marginBottom: '1.2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <h3 style={{ margin: 0 }}>
+                  Disbursement Plan for App #{disbursementPlan.applicationId}
+                </h3>
+                <span className="badge-status badge-status--eligible">
+                  Total Approved: ₹{disbursementPlan.totalAmount.toLocaleString('en-IN')}
+                </span>
+              </div>
+
+              {/* Check if plan is configured */}
+              {!disbursementPlan.milestones || disbursementPlan.milestones.length === 0 ? (
+                // CONFIGURATION FORM
+                <div>
+                  <h4 style={{ margin: '0 0 1rem 0' }}>Configure Milestones ({disbursementPlan.totalStages} Stages)</h4>
+                  <p style={{ color: 'var(--muted)', fontSize: '0.9rem', marginBottom: '1.5rem' }}>
+                    Configure the milestone names, amounts to release, and target due dates. The stage amounts must sum up to the total approved grant of ₹{disbursementPlan.totalAmount.toLocaleString('en-IN')}.
+                  </p>
+
+                  <table className="stage-config-table">
+                    <thead>
+                      <tr>
+                        <th style={{ width: '8%', color: 'var(--muted)' }}>Stage</th>
+                        <th style={{ width: '45%', color: 'var(--muted)' }}>Milestone Name</th>
+                        <th style={{ width: '25%', color: 'var(--muted)' }}>Amount to Release (₹)</th>
+                        <th style={{ width: '22%', color: 'var(--muted)' }}>Due Date</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {planConfigStages.map((stage, idx) => (
+                        <tr key={idx}>
+                          <td style={{ textAlign: 'center', fontWeight: 'bold', color: 'var(--text)' }}>{stage.stageNumber}</td>
+                          <td>
+                            <input 
+                              type="text" 
+                              value={stage.milestoneName} 
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setPlanConfigStages(prev => prev.map((s, i) => i === idx ? { ...s, milestoneName: val } : s))
+                              }}
+                              style={{ width: '100%', padding: '0.5rem', border: '1px solid var(--border)', borderRadius: '6px', background: 'var(--bg)', color: 'var(--text)' }}
+                            />
+                          </td>
+                          <td>
+                            <input 
+                              type="number" 
+                              value={stage.amountToRelease} 
+                              onChange={(e) => {
+                                const val = Number(e.target.value);
+                                setPlanConfigStages(prev => prev.map((s, i) => i === idx ? { ...s, amountToRelease: val } : s))
+                              }}
+                              style={{ width: '100%', padding: '0.5rem', border: '1px solid var(--border)', borderRadius: '6px', background: 'var(--bg)', color: 'var(--text)' }}
+                            />
+                          </td>
+                          <td>
+                            <input 
+                              type="date" 
+                              value={stage.dueDate} 
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setPlanConfigStages(prev => prev.map((s, i) => i === idx ? { ...s, dueDate: val } : s))
+                              }}
+                              style={{ width: '100%', padding: '0.5rem', border: '1px solid var(--border)', borderRadius: '6px', background: 'var(--bg)', color: 'var(--text)' }}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  {/* Show live sum tracker */}
+                  {(() => {
+                    const sum = planConfigStages.reduce((acc, curr) => acc + Number(curr.amountToRelease), 0);
+                    const diff = sum - disbursementPlan.totalAmount;
+                    if (Math.abs(diff) > 0.01) {
+                      return (
+                        <div className="sum-warning" style={{ color: '#ef4444', fontWeight: '600', marginBottom: '1rem' }}>
+                          ⚠️ Warning: Sum of stages (₹{sum.toLocaleString('en-IN')}) does not match the total approved grant (₹{disbursementPlan.totalAmount.toLocaleString('en-IN')}). Diff: ₹{diff.toLocaleString('en-IN')}.
+                        </div>
+                      );
+                    } else {
+                      return (
+                        <div className="sum-success" style={{ color: '#22c55e', fontWeight: '600', marginBottom: '1rem' }}>
+                          ✅ Verified: Sum of stages matches exactly the approved grant (₹{sum.toLocaleString('en-IN')}).
+                        </div>
+                      );
+                    }
+                  })()}
+
+                  <div style={{ display: 'flex', gap: '1rem', marginTop: '2rem' }}>
+                    <button className="button button--ghost" onClick={() => setShowDisbursementManager(false)}>Cancel</button>
+                    <button className="button button--primary" onClick={handleConfigurePlan}>Save Configuration</button>
+                  </div>
+                </div>
+              ) : (
+                // MILESTONE TIMELINE VIEW
+                <div>
+                  <h4 style={{ margin: '0 0 1.5rem 0' }}>Disbursement Milestone Tracking</h4>
+                  
+                  <div className="timeline">
+                    {disbursementPlan.milestones.map((m, idx) => {
+                      const isPrevReleasedOrCompleted = idx === 0 || 
+                        disbursementPlan.milestones.slice(0, idx).every(prev => 
+                          prev.completionStatus === 'RELEASED' || prev.completionStatus === 'COMPLETED'
+                        );
+                      
+                      const hasOverdueEarlier = disbursementPlan.milestones.slice(0, idx).some(prev => 
+                        prev.completionStatus === 'OVERDUE'
+                      );
+
+                      const isReleaseBlocked = !isPrevReleasedOrCompleted || hasOverdueEarlier || m.completionStatus !== 'COMPLETED';
+
+                      return (
+                        <div className="timeline-item" key={m.milestoneId}>
+                          <div className={`timeline-badge status-${m.completionStatus.toLowerCase()}`}>
+                            {m.stageNumber}
+                          </div>
+                          <div className="timeline-content">
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                              <h5 className="timeline-title">{m.milestoneName}</h5>
+                              <span className={`badge-status status-${m.completionStatus.toLowerCase()}`} style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}>
+                                {m.completionStatus}
+                              </span>
+                            </div>
+                            <div className="timeline-meta">
+                              <div><strong>Amount:</strong> ₹{m.amountToRelease.toLocaleString('en-IN')}</div>
+                              <div><strong>Due Date:</strong> {m.dueDate}</div>
+                              {m.completedDate && <div><strong>Completed:</strong> {m.completedDate}</div>}
+                              {m.releaseDate && <div><strong>Released:</strong> {m.releaseDate}</div>}
+                              {m.resolvedReason && (
+                                <div style={{ width: '100%', color: '#22c55e', marginTop: '0.3rem' }}>
+                                  <strong>Override Reason:</strong> {m.resolvedReason} (on {m.resolvedDate})
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="timeline-actions">
+                              {m.completionStatus === 'PENDING' && (
+                                <button 
+                                  className="button button--ghost" 
+                                  style={{ padding: '0.35rem 0.8rem', fontSize: '0.82rem' }}
+                                  onClick={() => handleCompleteMilestone(m.milestoneId)}
+                                >
+                                  Mark Completed
+                                </button>
+                              )}
+                              {m.completionStatus === 'COMPLETED' && (
+                                <button 
+                                  className="button button--primary" 
+                                  style={{ padding: '0.35rem 0.8rem', fontSize: '0.82rem' }}
+                                  onClick={() => handleReleaseMilestone(m.milestoneId)}
+                                  disabled={isReleaseBlocked}
+                                  title={
+                                    hasOverdueEarlier 
+                                      ? "Release blocked because an earlier stage is OVERDUE." 
+                                      : isReleaseBlocked 
+                                      ? "Previous stage must be complete/released to release funds." 
+                                      : "Release milestone funds"
+                                  }
+                                >
+                                  Release Funds
+                                </button>
+                              )}
+                              {m.completionStatus === 'OVERDUE' && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'flex-start' }}>
+                                  <span style={{ color: '#ef4444', fontSize: '0.85rem', fontWeight: 600 }}>
+                                    ⚠️ Non-compliant / Overdue
+                                  </span>
+                                  <button 
+                                    className="button button--secondary" 
+                                    style={{ padding: '0.35rem 0.8rem', fontSize: '0.82rem', borderColor: '#ef4444', color: '#ef4444' }}
+                                    onClick={() => {
+                                      setResolvingMilestoneId(m.milestoneId)
+                                      setShowResolveModal(true)
+                                    }}
+                                  >
+                                    Resolve Overdue
+                                  </button>
+                                </div>
+                              )}
+                              {m.completionStatus === 'RELEASED' && (
+                                <span style={{ color: '#22c55e', fontSize: '0.85rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                                  ✓ Funds Disbursed (₹{m.amountReleased.toLocaleString('en-IN')})
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '1rem', marginTop: '2rem' }}>
+                    <button className="button button--ghost" onClick={() => setShowDisbursementManager(false)}>Close</button>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Admin Override Resolve Modal */}
+      <AnimatePresence>
+        {showResolveModal && (
+          <div className="modal-overlay" onClick={() => {
+            setShowResolveModal(false)
+            setResolvedReasonInput('')
+          }}>
+            <motion.div
+              className="modal-panel"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              onClick={(e) => e.stopPropagation()}
+              style={{ maxWidth: '450px', textAlign: 'left' }}
+            >
+              <h3 style={{ margin: '0 0 1rem 0', color: '#ef4444' }}>Admin Compliance Override</h3>
+              <p style={{ fontSize: '0.9rem', color: 'var(--muted)', marginBottom: '1.5rem' }}>
+                You are performing an administrative override to resolve overdue milestone #{resolvingMilestoneId}. A mandatory resolution reason must be provided to audit this transaction.
+              </p>
+
+              <div className="delete-confirm-box" style={{ marginBottom: '1.5rem' }}>
+                <label style={{ fontWeight: 600, fontSize: '0.85rem' }}>Reason for Resolution</label>
+                <textarea
+                  placeholder="Enter administrative justification for override..."
+                  value={resolvedReasonInput}
+                  onChange={(e) => setResolvedReasonInput(e.target.value)}
+                  rows={4}
+                  style={{ 
+                    width: '100%', 
+                    padding: '0.6rem', 
+                    borderRadius: '6px', 
+                    border: '1px solid var(--border)', 
+                    background: 'var(--bg)', 
+                    color: 'var(--text)',
+                    fontFamily: 'inherit',
+                    fontSize: '0.9rem',
+                    resize: 'none',
+                    marginTop: '0.4rem'
+                  }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end' }}>
+                <button className="button button--ghost" onClick={() => {
+                  setShowResolveModal(false)
+                  setResolvedReasonInput('')
+                }}>
+                  Cancel
+                </button>
+                <button 
+                  className="button button--primary" 
+                  style={{ background: '#ef4444', borderColor: '#ef4444' }}
+                  onClick={handleResolveMilestone}
+                  disabled={isResolving || !resolvedReasonInput.trim()}
+                >
+                  {isResolving ? 'Resolving...' : 'Confirm Resolve'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <style>{`
+        .timeline {
+          position: relative;
+          padding: 1.5rem 0;
+          margin-left: 1.5rem;
+          border-left: 2px solid var(--border);
+        }
+        .timeline-item {
+          position: relative;
+          margin-bottom: 2rem;
+          padding-left: 2rem;
+        }
+        .timeline-item:last-child {
+          margin-bottom: 0;
+        }
+        .timeline-badge {
+          position: absolute;
+          left: -11px;
+          top: 2px;
+          width: 20px;
+          height: 20px;
+          border-radius: 50%;
+          background: var(--bg);
+          border: 2px solid var(--border);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 0.75rem;
+          font-weight: bold;
+          color: var(--muted);
+        }
+        .timeline-badge.status-completed {
+          background: #a855f7;
+          border-color: #a855f7;
+          color: #fff;
+        }
+        .timeline-badge.status-released {
+          background: #22c55e;
+          border-color: #22c55e;
+          color: #fff;
+        }
+        .timeline-badge.status-pending {
+          background: #eab308;
+          border-color: #eab308;
+          color: #fff;
+        }
+        .timeline-content {
+          background: var(--card-bg);
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          padding: 1.2rem;
+        }
+        .timeline-title {
+          font-weight: 600;
+          font-size: 0.95rem;
+          margin: 0 0 0.5rem 0;
+          color: var(--text);
+        }
+        .timeline-meta {
+          font-size: 0.8rem;
+          color: var(--muted);
+          margin-bottom: 1rem;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 1.2rem;
+        }
+        .timeline-actions {
+          display: flex;
+          gap: 0.75rem;
+          align-items: center;
+        }
+        .stage-config-table {
+          width: 100%;
+          border-collapse: collapse;
+          margin: 1.5rem 0;
+        }
+        .stage-config-table th {
+          font-size: 0.8rem;
+          font-weight: 600;
+          padding: 0.6rem;
+          text-align: left;
+        }
+        .stage-config-table td {
+          padding: 0.5rem 0.25rem;
+        }
+        .badge-status.status-completed {
+          background: rgba(168, 85, 247, 0.15);
+          color: #a855f7;
+          border: 1px solid rgba(168, 85, 247, 0.3);
+        }
+        .badge-status.status-released {
+          background: rgba(34, 197, 94, 0.15);
+          color: #22c55e;
+          border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+        .badge-status.status-pending {
+          background: rgba(234, 179, 8, 0.15);
+          color: #eab308;
+          border: 1px solid rgba(234, 179, 8, 0.3);
+        }
+        .timeline-badge.status-overdue {
+          background: #ef4444;
+          border-color: #ef4444;
+          color: #fff;
+        }
+        .badge-status.status-overdue {
+          background: rgba(239, 68, 68, 0.15);
+          color: #ef4444;
+          border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+      `}</style>
+    </div>
+  )
+}
